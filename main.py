@@ -585,4 +585,11 @@ async def api_watch(req: WatchRequest):
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+        from fastapi.responses import RedirectResponse
+
+@app.get("/api/poster/{file_id}")
+async def get_poster(file_id: str):
+    f = await bot.get_file(file_id)
+    return RedirectResponse(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}")
+                      
     

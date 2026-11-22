@@ -285,11 +285,17 @@ async def adm_add_year(message: types.Message, state: FSMContext):
 
 @dp.message(AdminStates.add_poster)
 async def adm_add_poster(message: types.Message, state: FSMContext):
-    poster = message.text.strip() if message.text and message.text.startswith("http") else "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500&q=80"
+    if message.photo:
+        poster = f"https://filmora-server.onrender.com/api/poster/{message.photo[-1].file_id}"
+    elif message.text and message.text.startswith("http"):
+        poster = message.text.strip()
+    else:
+        poster = "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500&q=80"
     await state.update_data(poster=poster)
     await state.set_state(AdminStates.add_premium)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎬 Oddiy (Bepul)", callback_data="set_mtype:free"), InlineKeyboardButton(text="💎 Premium", callback_data="set_mtype:prem")]])
     await message.answer("5️⃣ Kino turini tanlang:", reply_markup=kb)
+    
 
 
 @dp.callback_query(AdminStates.add_premium, F.data.startswith("set_mtype:"))

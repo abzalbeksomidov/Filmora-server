@@ -20,7 +20,7 @@ from aiogram.types import (
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = 8751791526
+ADMIN_ID = 6248171499
 BAZA_CHANNEL_ID = -1003958730565
 MINI_APP_URL = "https://abzalbeksomidov.github.io/Filmora-app/"
 

@@ -5,6 +5,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
@@ -28,11 +29,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 DB = {
-    "movies": {
-        "1000": {"msg_id": 2, "title": "Test Kino (1000)", "year": "2026 • Jangari", "poster": "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500&q=80", "type": "movie", "premium": False},
-        "999": {"msg_id": 2, "title": "Jang ortidan jang", "year": "2025 • Jangari, Triller", "poster": "https://images.unsplash.com/photo-1509347528160-9a9e33742cdb?w=500&q=80", "type": "movie", "premium": False},
-        "998": {"msg_id": 2, "title": "Muzyorar (Snowpiercer)", "year": "2013 • Fantastika", "poster": "https://images.unsplash.com/photo-1478720568477-152d9b164e26?w=500&q=80", "type": "movie", "premium": False},
-    },
+    "movies": {},
     "channels": [{"id": "@filmora_kinolar", "title": "Filmora Kinolar", "url": "https://t.me/filmora_kinolar", "active": True}],
     "premium_users": {},
     "users": [],
@@ -106,13 +103,27 @@ def main_reply_keyboard(user_id: int):
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
+async def deliver_movie(user_id: int, movie: dict):
+    episodes = movie.get("episodes") or ([movie["msg_id"]] if "msg_id" in movie else [])
+    if len(episodes) <= 1:
+        await bot.copy_message(user_id, BAZA_CHANNEL_ID, episodes[0], caption=f"🎬 <b>{movie['title']}</b>\n📅 {movie.get('year', '')}\n\n📢 @filmora_kinolar", parse_mode="HTML")
+    else:
+        await bot.send_message(user_id, f"📺 <b>{movie['title']}</b> ({len(episodes)} ta qism yuborilmoqda...)", parse_mode="HTML")
+        for idx, ep_id in enumerate(episodes, 1):
+            await bot.copy_message(user_id, BAZA_CHANNEL_ID, ep_id, caption=f"📺 <b>{movie['title']}</b> — {idx}-qism", parse_mode="HTML")
+            await asyncio.sleep(0.35)
+
+
 class AdminStates(StatesGroup):
+    add_kind = State()
     add_code = State()
     add_title = State()
     add_year = State()
     add_poster = State()
     add_premium = State()
     add_video = State()
+    ep_code = State()
+    ep_video = State()
     edit_code = State()
     edit_new_title = State()
     del_code = State()
@@ -132,7 +143,8 @@ def admin_panel_kb():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="➕ Kino / Serial qo‘shish", callback_data="adm_add_movie")],
-            [InlineKeyboardButton(text="✏️ Kinoni tahrirlash", callback_data="adm_edit_movie"), InlineKeyboardButton(text="🗑 Kinoni o‘chirish", callback_data="adm_del_movie")],
+            [InlineKeyboardButton(text="📺 Serialga yangi qism qo‘shish", callback_data="adm_add_ep")],
+            [InlineKeyboardButton(text="✏️ Tahrirlash", callback_data="adm_edit_movie"), InlineKeyboardButton(text="🗑 O‘chirish", callback_data="adm_del_movie")],
             [InlineKeyboardButton(text="📢 Majburiy obuna kanallari", callback_data="adm_channels")],
             [InlineKeyboardButton(text=f"🔒 Majburiy obuna: {sub_state}", callback_data="adm_toggle_sub")],
             [InlineKeyboardButton(text="💳 Karta raqami", callback_data="adm_set_card"), InlineKeyboardButton(text="💰 Premium narxi", callback_data="adm_set_price")],
@@ -153,7 +165,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if missing:
         await message.answer("🎬 Kinolarni ko‘rish uchun avval kanallarga obuna bo‘ling:", reply_markup=sub_keyboard(missing))
         return
-    await message.answer("👋 Assalomu alaykum! <b>Filmora Kinolar</b> botiga xush kelibsiz.\n\n✍️ Kino kodini yuboring yoki katalogni oching:", parse_mode="HTML", reply_markup=main_reply_keyboard(uid))
+    await message.answer("👋 Assalomu alaykum! <b>Filmora Kinolar</b> botiga xush kelibsiz.\n\n✍️ Kino yoki serial kodini yuboring:", parse_mode="HTML", reply_markup=main_reply_keyboard(uid))
 
 
 @dp.callback_query(F.data == "check_sub")
@@ -168,7 +180,7 @@ async def check_sub_cb(call: types.CallbackQuery):
 @dp.message(F.text == "🔎 Kino kodi")
 async def ask_code(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("✍️ Kinoning kodini yozib yuboring (masalan: <code>1000</code>):", parse_mode="HTML")
+    await message.answer("✍️ Kino yoki serial kodini yozib yuboring:")
 
 
 @dp.message(F.text == "📢 Kanalimiz")
@@ -257,8 +269,17 @@ async def open_admin_panel(message: types.Message, state: FSMContext):
 async def adm_add_movie(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
         return
+    await state.set_state(AdminStates.add_kind)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎬 Kino (1 qismli)", callback_data="kind:movie"), InlineKeyboardButton(text="📺 Serial (ko‘p qismli)", callback_data="kind:series")]])
+    await call.message.answer("1️⃣ Nima qo‘shmoqchisiz?", reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(AdminStates.add_kind, F.data.startswith("kind:"))
+async def adm_set_kind(call: types.CallbackQuery, state: FSMContext):
+    await state.update_data(kind=call.data.split(":")[1], episodes=[])
     await state.set_state(AdminStates.add_code)
-    await call.message.answer("1️⃣ Kino kodini kiriting (masalan: <code>991</code>):", parse_mode="HTML")
+    await call.message.answer("2️⃣ Kodini kiriting (masalan: <code>991</code>):", parse_mode="HTML")
     await call.answer()
 
 
@@ -266,21 +287,21 @@ async def adm_add_movie(call: types.CallbackQuery, state: FSMContext):
 async def adm_add_code(message: types.Message, state: FSMContext):
     await state.update_data(code=message.text.strip())
     await state.set_state(AdminStates.add_title)
-    await message.answer("2️⃣ Kino nomini kiriting:")
+    await message.answer("3️⃣ Nomini kiriting:")
 
 
 @dp.message(AdminStates.add_title)
 async def adm_add_title(message: types.Message, state: FSMContext):
     await state.update_data(title=message.text.strip())
     await state.set_state(AdminStates.add_year)
-    await message.answer("3️⃣ Yili va janrini kiriting (masalan: <code>2025 • Jangari</code>):", parse_mode="HTML")
+    await message.answer("4️⃣ Yili va janrini kiriting (masalan: <code>2025 • Jangari</code>):", parse_mode="HTML")
 
 
 @dp.message(AdminStates.add_year)
 async def adm_add_year(message: types.Message, state: FSMContext):
     await state.update_data(year=message.text.strip())
     await state.set_state(AdminStates.add_poster)
-    await message.answer("4️⃣ Poster rasm havolasini yuboring yoki <code>-</code> yozing:", parse_mode="HTML")
+    await message.answer("5️⃣ Poster rasmini yuboring (galereyadan rasm yoki havola):")
 
 
 @dp.message(AdminStates.add_poster)
@@ -294,15 +315,18 @@ async def adm_add_poster(message: types.Message, state: FSMContext):
     await state.update_data(poster=poster)
     await state.set_state(AdminStates.add_premium)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎬 Oddiy (Bepul)", callback_data="set_mtype:free"), InlineKeyboardButton(text="💎 Premium", callback_data="set_mtype:prem")]])
-    await message.answer("5️⃣ Kino turini tanlang:", reply_markup=kb)
-    
+    await message.answer("6️⃣ Turini tanlang:", reply_markup=kb)
 
 
 @dp.callback_query(AdminStates.add_premium, F.data.startswith("set_mtype:"))
 async def adm_set_mtype(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
     await state.update_data(premium=(call.data.split(":")[1] == "prem"))
     await state.set_state(AdminStates.add_video)
-    await call.message.answer("6️⃣ Endi <b>kino videosini</b> yuboring:", parse_mode="HTML")
+    if data["kind"] == "series":
+        await call.message.answer("7️⃣ Serialning <b>1-qism</b> videosini yuboring (keyin 2, 3... qismlarni ketma-ket tashlaysiz):", parse_mode="HTML")
+    else:
+        await call.message.answer("7️⃣ Endi <b>kino videosini</b> yuboring:", parse_mode="HTML")
     await call.answer()
 
 
@@ -310,16 +334,67 @@ async def adm_set_mtype(call: types.CallbackQuery, state: FSMContext):
 async def adm_save_video(message: types.Message, state: FSMContext):
     data = await state.get_data()
     sent = await bot.copy_message(BAZA_CHANNEL_ID, message.chat.id, message.message_id)
-    DB["movies"][data["code"]] = {"msg_id": sent.message_id, "title": data["title"], "year": data["year"], "poster": data["poster"], "type": "movie", "premium": data["premium"]}
+    episodes = data.get("episodes", [])
+    episodes.append(sent.message_id)
+    await state.update_data(episodes=episodes)
+    if data["kind"] == "movie":
+        DB["movies"][data["code"]] = {"episodes": episodes, "title": data["title"], "year": data["year"], "poster": data["poster"], "type": "movie", "premium": data["premium"]}
+        await save_db()
+        await state.clear()
+        await message.answer(f"✅ Kino <b>{data['title']}</b> (Kod: <code>{data['code']}</code>) saqlandi!", parse_mode="HTML", reply_markup=admin_panel_kb())
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"✅ Saqlash ({len(episodes)} ta qism)", callback_data="finish_series")]])
+        await message.answer(f"✅ <b>{len(episodes)}-qism</b> qabul qilindi!\nKeyingi qism videosini tashlang yoki tugatish uchun pastdagi tugmani bosing:", parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(AdminStates.add_video, F.data == "finish_series")
+async def finish_series_cb(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    episodes = data.get("episodes", [])
+    DB["movies"][data["code"]] = {"episodes": episodes, "title": data["title"], "year": data["year"], "poster": data["poster"], "type": "series", "premium": data["premium"]}
     await save_db()
     await state.clear()
-    await message.answer(f"✅ <b>{data['title']}</b> (Kod: <code>{data['code']}</code>) qo‘shildi!", parse_mode="HTML", reply_markup=admin_panel_kb())
+    await call.message.answer(f"✅ Serial <b>{data['title']}</b> ({len(episodes)} ta qism, Kod: <code>{data['code']}</code>) saqlandi!", parse_mode="HTML", reply_markup=admin_panel_kb())
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm_add_ep")
+async def adm_add_ep(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.ep_code)
+    await call.message.answer("📺 Yangi qism qo‘shiladigan serial kodini yuboring:")
+    await call.answer()
+
+
+@dp.message(AdminStates.ep_code)
+async def adm_ep_code(message: types.Message, state: FSMContext):
+    code = message.text.strip()
+    if code not in DB["movies"]:
+        await message.answer("❌ Bunday kodli serial topilmadi.")
+        await state.clear()
+        return
+    await state.update_data(code=code)
+    await state.set_state(AdminStates.ep_video)
+    cur = len(DB["movies"][code].get("episodes", []))
+    await message.answer(f"🎬 <b>{DB['movies'][code]['title']}</b> (hozir {cur} ta qism bor).\nEndi <b>{cur + 1}-qism</b> videosini yuboring:", parse_mode="HTML")
+
+
+@dp.message(AdminStates.ep_video, F.video | F.document)
+async def adm_ep_video(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    code = data["code"]
+    sent = await bot.copy_message(BAZA_CHANNEL_ID, message.chat.id, message.message_id)
+    DB["movies"][code].setdefault("episodes", []).append(sent.message_id)
+    DB["movies"][code]["type"] = "series"
+    await save_db()
+    await state.clear()
+    total = len(DB["movies"][code]["episodes"])
+    await message.answer(f"✅ <b>{total}-qism</b> muvaffaqiyatli qo‘shildi!", parse_mode="HTML", reply_markup=admin_panel_kb())
 
 
 @dp.callback_query(F.data == "adm_edit_movie")
 async def adm_edit_movie(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.edit_code)
-    await call.message.answer("✏️ Kino kodini yuboring:")
+    await call.message.answer("✏️ Kodini yuboring:")
     await call.answer()
 
 
@@ -343,7 +418,7 @@ async def adm_edit_action(call: types.CallbackQuery, state: FSMContext):
         DB["movies"][code]["premium"] = not DB["movies"][code].get("premium", False)
         await save_db()
         await state.clear()
-        await call.message.answer("✅ Kino turi o‘zgartirildi!", reply_markup=admin_panel_kb())
+        await call.message.answer("✅ Turi o‘zgartirildi!", reply_markup=admin_panel_kb())
     else:
         await state.set_state(AdminStates.edit_new_title)
         await call.message.answer("📝 Yangi nomni kiriting:")
@@ -362,7 +437,7 @@ async def adm_save_new_title(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "adm_del_movie")
 async def adm_del_movie(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.del_code)
-    await call.message.answer("🗑 O‘chiriladigan kino kodini yuboring:")
+    await call.message.answer("🗑 O‘chiriladigan kodini yuboring:")
     await call.answer()
 
 
@@ -495,7 +570,7 @@ async def adm_give_prem_done(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "adm_stats")
 async def adm_stats(call: types.CallbackQuery):
     active_prem = sum(1 for exp in DB["premium_users"].values() if exp > int(time.time()))
-    await call.message.answer(f"📊 Foydalanuvchilar: <b>{len(DB['users'])}</b>\n💎 Premium: <b>{active_prem}</b>\n🎬 Kinolar: <b>{len(DB['movies'])}</b>", parse_mode="HTML")
+    await call.message.answer(f"📊 Foydalanuvchilar: <b>{len(DB['users'])}</b>\n💎 Premium: <b>{active_prem}</b>\n🎬 Kinolar/Seriallar: <b>{len(DB['movies'])}</b>", parse_mode="HTML")
     await call.answer()
 
 
@@ -535,9 +610,9 @@ async def send_movie_by_code(message: types.Message):
         await premium_info(message, None)
         return
     try:
-        await bot.copy_message(uid, BAZA_CHANNEL_ID, movie["msg_id"])
+        await deliver_movie(uid, movie)
     except Exception:
-        await message.answer("⚠️ Kino yuborishda xatolik.")
+        await message.answer("⚠️ Yuborishda xatolik.")
 
 
 class WatchRequest(BaseModel):
@@ -563,9 +638,15 @@ async def health():
     return {"status": "ok", "movies": len(DB["movies"])}
 
 
+@app.get("/api/poster/{file_id}")
+async def get_poster(file_id: str):
+    f = await bot.get_file(file_id)
+    return RedirectResponse(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}")
+
+
 @app.get("/api/catalog")
 async def api_catalog():
-    return {"items": [{"id": c, "type": m.get("type", "movie"), "title": m["title"], "year": m.get("year", ""), "poster": m.get("poster", ""), "code": c, "premium": m.get("premium", False)} for c, m in DB["movies"].items()]}
+    return {"items": [{"id": c, "type": m.get("type", "movie"), "title": m["title"], "year": m.get("year", ""), "poster": m.get("poster", ""), "code": c, "premium": m.get("premium", False), "ep_count": len(m.get("episodes", [1]))} for c, m in DB["movies"].items()]}
 
 
 @app.post("/api/watch")
@@ -576,20 +657,13 @@ async def api_watch(req: WatchRequest):
         return {"ok": False, "error": "not_subscribed"}
     movie = DB["movies"].get(req.code)
     if not movie:
-        raise HTTPException(status_code=404, detail="Kino topilmadi")
+        raise HTTPException(status_code=404, detail="Topilmadi")
     if movie.get("premium") and not is_premium(req.user_id):
-        await bot.send_message(req.user_id, f"💎 <b>{movie['title']}</b> — Premium kino!", parse_mode="HTML")
+        await bot.send_message(req.user_id, f"💎 <b>{movie['title']}</b> — Premium!", parse_mode="HTML")
         return {"ok": False, "error": "premium_required"}
     try:
-        await bot.copy_message(req.user_id, BAZA_CHANNEL_ID, movie["msg_id"])
+        await deliver_movie(req.user_id, movie)
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-        from fastapi.responses import RedirectResponse
-
-@app.get("/api/poster/{file_id}")
-async def get_poster(file_id: str):
-    f = await bot.get_file(file_id)
-    return RedirectResponse(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}")
-                      
     

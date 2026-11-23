@@ -165,7 +165,8 @@ async def send_content_to_user(user_id: int, code: str, ep_idx: int = 1):
         f"🇺🇿 Til: O‘zbek tilida\n⭐ Reyting: {get_rating_str(m)}\n👁 Ko‘rishlar: {m['views']}\n\n"
         f"🎬 <b>FILMORA | PRO</b> BILAN ZAVQ OLING\n🔢 Kod: <code>{code}</code> • @{BOT_USERNAME}"
     )
-    await bot.copy_message(user_id, BAZA_CHANNEL_ID, episodes[ep_idx - 1], caption=caption, parse_mode="HTML", reply_markup=movie_inline_kb(code, m, ep_idx))
+        await bot.copy_message(user_id, BAZA_CHANNEL_ID, episodes[ep_idx - 1], caption=caption, parse_mode="HTML", reply_markup=movie_inline_kb(code, m, ep_idx))
+
  class AdminStates(StatesGroup):
     add_kind = State()
     add_code = State()

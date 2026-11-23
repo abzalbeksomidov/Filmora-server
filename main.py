@@ -107,7 +107,7 @@ def sub_keyboard(missing_channels):
 
 def main_reply_keyboard(user_id: int):
     kb = [
-        [KeyboardButton(text="🎬 FILMORA PRO (Katalog)", web_app=WebAppInfo(url=MINI_APP_URL))],
+        [KeyboardButton(text="🎬 FILMORA PRO (Katalog)"],
         [KeyboardButton(text="🔎 Kino kodi"), KeyboardButton(text="💎 VIP / Premium")],
         [KeyboardButton(text="📝 Kino zakaz"), KeyboardButton(text="👤 Profilim")],
     ]
@@ -243,6 +243,13 @@ async def check_sub_cb(call: types.CallbackQuery):
         await call.message.answer("✅ Obuna tasdiqlandi!", reply_markup=main_reply_keyboard(call.from_user.id))
     else:
         await call.answer("❌ Hali barcha kanallarga obuna bo‘lmagansiz!", show_alert=True)
+@dp.message(F.text == "🎬 FILMORA PRO (Katalog)")
+async def open_catalog_btn(message: types.Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🎬 FILMORA PRO Katalogini ochish", web_app=WebAppInfo(url=MINI_APP_URL))
+    ]])
+    await message.answer("🍿 <b>FILMORA | PRO</b> katalogiga kirish uchun quyidagi tugmani bosing:", parse_mode="HTML", reply_markup=kb)
+
 
 
 @dp.message(F.text == "🔎 Kino kodi")

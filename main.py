@@ -2,6 +2,7 @@ import os
 import json
 import time
 import asyncio
+from datetime import datetime
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +25,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = 6248171499
 BAZA_CHANNEL_ID = -1003958730565
 MINI_APP_URL = "https://abzalbeksomidov.github.io/Filmora-app/"
+BOT_USERNAME = "Filmorabot_bot"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -32,10 +34,19 @@ DB = {
     "movies": {},
     "channels": [{"id": "@filmora_kinolar", "title": "Filmora Kinolar", "url": "https://t.me/filmora_kinolar", "active": True}],
     "premium_users": {},
-    "users": [],
+    "users": {},
     "settings": {"card": "Karta kiritilmagan (/panel)", "price": "15 000 so‘m (1 oy)", "sub_enabled": True},
 }
 DB_MSG_ID = None
+
+
+def ensure_user(uid: int, name: str = "Foydalanuvchi"):
+    suid = str(uid)
+    if suid not in DB["users"]:
+        DB["users"][suid] = {"name": name, "favs": [], "subs": [], "history": [], "progress": {}, "refs": [], "referred_by": None}
+    elif name and name != "Foydalanuvchi":
+        DB["users"][suid]["name"] = name
+    return DB["users"][suid]
 
 
 async def load_db():
@@ -43,7 +54,10 @@ async def load_db():
     try:
         chat = await bot.get_chat(BAZA_CHANNEL_ID)
         if chat.pinned_message and chat.pinned_message.text and chat.pinned_message.text.startswith("FILMORA_DB:"):
-            DB.update(json.loads(chat.pinned_message.text.replace("FILMORA_DB:", "", 1).strip()))
+            loaded = json.loads(chat.pinned_message.text.replace("FILMORA_DB:", "", 1).strip())
+            if isinstance(loaded.get("users"), list):
+                loaded["users"] = {str(u): {"name": "Foydalanuvchi", "favs": [], "subs": [], "history": [], "progress": {}, "refs": [], "referred_by": None} for u in loaded["users"]}
+            DB.update(loaded)
             DB_MSG_ID = chat.pinned_message.message_id
             return
     except Exception as e:
@@ -93,32 +107,72 @@ def sub_keyboard(missing_channels):
 
 def main_reply_keyboard(user_id: int):
     kb = [
-        [KeyboardButton(text="🎬 Kinolar katalogi", web_app=WebAppInfo(url=MINI_APP_URL))],
-        [KeyboardButton(text="🔎 Kino kodi"), KeyboardButton(text="💎 Premium")],
-        [KeyboardButton(text="📝 Kino zakaz qilish"), KeyboardButton(text="👤 Profilim")],
-        [KeyboardButton(text="📢 Kanalimiz")],
+        [KeyboardButton(text="🎬 FILMORA PRO (Katalog)", web_app=WebAppInfo(url=MINI_APP_URL))],
+        [KeyboardButton(text="🔎 Kino kodi"), KeyboardButton(text="💎 VIP / Premium")],
+        [KeyboardButton(text="📝 Kino zakaz"), KeyboardButton(text="👤 Profilim")],
     ]
     if user_id == ADMIN_ID:
         kb.append([KeyboardButton(text="⚙️ Admin Panel")])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
-async def deliver_movie(user_id: int, movie: dict):
-    episodes = movie.get("episodes") or ([movie["msg_id"]] if "msg_id" in movie else [])
-    if len(episodes) <= 1:
-        await bot.copy_message(user_id, BAZA_CHANNEL_ID, episodes[0], caption=f"🎬 <b>{movie['title']}</b>\n📅 {movie.get('year', '')}\n\n📢 @filmora_kinolar", parse_mode="HTML")
+def get_rating_str(m: dict) -> str:
+    votes = m.get("votes", [])
+    return f"{round(sum(votes) / len(votes), 1)}/5 ({len(votes)} ta ovoz)" if votes else "hali baho yo‘q"
+
+
+def movie_inline_kb(code: str, m: dict, ep_idx: int = 1):
+    episodes = m.get("episodes", [])
+    rows = []
+    if m.get("type") == "series" and len(episodes) > 1:
+        nav = []
+        if ep_idx > 1:
+            nav.append(InlineKeyboardButton(text=f"⬅️ {ep_idx - 1}-qism", callback_data=f"ep:{code}:{ep_idx - 1}"))
+        if ep_idx < len(episodes):
+            nav.append(InlineKeyboardButton(text=f"{ep_idx + 1}-qism ➡️", callback_data=f"ep:{code}:{ep_idx + 1}"))
+        if nav:
+            rows.append(nav)
+        rows.append([InlineKeyboardButton(text="📑 Barcha qismlar", callback_data=f"alleps:{code}"), InlineKeyboardButton(text="🔔 Kuzatish", callback_data=f"subser:{code}")])
+    rows.append([InlineKeyboardButton(text="❤️ Saralanganlarga", callback_data=f"fav:{code}"), InlineKeyboardButton(text="📤 Ulashish", switch_inline_query=f"🎬 {m['title']} (Kod: {code})")])
+    rows.append([InlineKeyboardButton(text=f"{i}⭐", callback_data=f"rate:{code}:{i}") for i in range(1, 6)])
+    rows.append([InlineKeyboardButton(text="🎬 O‘xshash kinolar", web_app=WebAppInfo(url=MINI_APP_URL))])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_content_to_user(user_id: int, code: str, ep_idx: int = 1):
+    m = DB["movies"].get(code)
+    if not m:
+        return
+    u = ensure_user(user_id)
+    episodes = m.get("episodes") or ([m["msg_id"]] if "msg_id" in m else [])
+    if not episodes:
+        return
+    ep_idx = max(1, min(ep_idx, len(episodes)))
+    m["views"] = m.get("views", 0) + 1
+    ep_views = m.setdefault("ep_views", {})
+    ep_views[str(ep_idx)] = ep_views.get(str(ep_idx), 0) + 1
+    if m.get("type") == "series":
+        u["progress"][code] = ep_idx
+        title_line = f"🎬 <b>{m['title']}</b>\n📺 <b>{ep_idx}-qism</b> ({len(episodes)} ta qismdan)"
     else:
-        await bot.send_message(user_id, f"📺 <b>{movie['title']}</b> ({len(episodes)} ta qism yuborilmoqda...)", parse_mode="HTML")
-        for idx, ep_id in enumerate(episodes, 1):
-            await bot.copy_message(user_id, BAZA_CHANNEL_ID, ep_id, caption=f"📺 <b>{movie['title']}</b> — {idx}-qism", parse_mode="HTML")
-            await asyncio.sleep(0.35)
-
-
-class AdminStates(StatesGroup):
+        title_line = f"🎬 <b>{m['title']}</b> ({m.get('year', '')})"
+    u["history"] = [h for h in u["history"] if h.get("code") != code]
+    u["history"].insert(0, {"code": code, "ep": ep_idx, "date": datetime.now().strftime("%d-%b")})
+    u["history"] = u["history"][:30]
+    await save_db()
+    caption = (
+        f"{title_line}\n\n🎭 Janr: {m.get('genre', 'Drama')}\n🌍 Davlat: {m.get('country', 'AQSH')}\n"
+        f"🇺🇿 Til: O‘zbek tilida\n⭐ Reyting: {get_rating_str(m)}\n👁 Ko‘rishlar: {m['views']}\n\n"
+        f"🎬 <b>FILMORA | PRO</b> BILAN ZAVQ OLING\n🔢 Kod: <code>{code}</code> • @{BOT_USERNAME}"
+    )
+    await bot.copy_message(user_id, BAZA_CHANNEL_ID, episodes[ep_idx - 1], caption=caption, parse_mode="HTML", reply_markup=movie_inline_kb(code, m, ep_idx))
+        class AdminStates(StatesGroup):
     add_kind = State()
     add_code = State()
     add_title = State()
     add_year = State()
+    add_genre = State()
+    add_country = State()
     add_poster = State()
     add_premium = State()
     add_video = State()
@@ -142,13 +196,13 @@ def admin_panel_kb():
     sub_state = "🟢 Yoqilgan" if DB["settings"].get("sub_enabled", True) else "🔴 O‘chirilgan"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Kino / Serial qo‘shish", callback_data="adm_add_movie")],
-            [InlineKeyboardButton(text="📺 Serialga yangi qism qo‘shish", callback_data="adm_add_ep")],
+            [InlineKeyboardButton(text="🎬 Kino / Multfilm joylash", callback_data="add_kind:movie")],
+            [InlineKeyboardButton(text="📺 Serial joylash (1-qism)", callback_data="add_kind:series"), InlineKeyboardButton(text="➕ Qism joylash", callback_data="adm_add_ep")],
             [InlineKeyboardButton(text="✏️ Tahrirlash", callback_data="adm_edit_movie"), InlineKeyboardButton(text="🗑 O‘chirish", callback_data="adm_del_movie")],
             [InlineKeyboardButton(text="📢 Majburiy obuna kanallari", callback_data="adm_channels")],
             [InlineKeyboardButton(text=f"🔒 Majburiy obuna: {sub_state}", callback_data="adm_toggle_sub")],
-            [InlineKeyboardButton(text="💳 Karta raqami", callback_data="adm_set_card"), InlineKeyboardButton(text="💰 Premium narxi", callback_data="adm_set_price")],
-            [InlineKeyboardButton(text="💎 Foydalanuvchiga Premium berish", callback_data="adm_give_prem")],
+            [InlineKeyboardButton(text="💳 Karta raqami", callback_data="adm_set_card"), InlineKeyboardButton(text="💰 VIP narxi", callback_data="adm_set_price")],
+            [InlineKeyboardButton(text="💎 Foydalanuvchiga VIP berish", callback_data="adm_give_prem")],
             [InlineKeyboardButton(text="📊 Statistika", callback_data="adm_stats"), InlineKeyboardButton(text="📣 Xabar tarqatish", callback_data="adm_broadcast")],
         ]
     )
@@ -158,14 +212,27 @@ def admin_panel_kb():
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
-    if uid not in DB["users"]:
-        DB["users"].append(uid)
-        await save_db()
+    is_new = str(uid) not in DB["users"]
+    u = ensure_user(uid, message.from_user.full_name)
+    parts = message.text.split()
+    if is_new and len(parts) > 1 and parts[1].startswith("ref_"):
+        ref_id = parts[1].replace("ref_", "")
+        if ref_id != str(uid) and ref_id in DB["users"]:
+            u["referred_by"] = ref_id
+            if uid not in DB["users"][ref_id]["refs"]:
+                DB["users"][ref_id]["refs"].append(uid)
+                if len(DB["users"][ref_id]["refs"]) >= 5:
+                    DB["premium_users"][ref_id] = max(DB["premium_users"].get(ref_id, int(time.time())), int(time.time())) + 30 * 86400
+                    try:
+                        await bot.send_message(int(ref_id), "🎉 5 ta do‘stingizni taklif qilganingiz uchun sizga <b>30 kunlik VIP</b> berildi!", parse_mode="HTML")
+                    except Exception:
+                        pass
+    await save_db()
     missing = await get_unsubscribed_channels(uid)
     if missing:
         await message.answer("🎬 Kinolarni ko‘rish uchun avval kanallarga obuna bo‘ling:", reply_markup=sub_keyboard(missing))
         return
-    await message.answer("👋 Assalomu alaykum! <b>Filmora Kinolar</b> botiga xush kelibsiz.\n\n✍️ Kino yoki serial kodini yuboring:", parse_mode="HTML", reply_markup=main_reply_keyboard(uid))
+    await message.answer("👋 Xush kelibsiz! <b>FILMORA | PRO</b> katalogini oching yoki kino kodini yuboring:", parse_mode="HTML", reply_markup=main_reply_keyboard(uid))
 
 
 @dp.callback_query(F.data == "check_sub")
@@ -183,22 +250,18 @@ async def ask_code(message: types.Message, state: FSMContext):
     await message.answer("✍️ Kino yoki serial kodini yozib yuboring:")
 
 
-@dp.message(F.text == "📢 Kanalimiz")
-async def our_channel(message: types.Message):
-    await message.answer("📢 Asosiy kanalimiz: @filmora_kinolar")
-
-
 @dp.message(F.text == "👤 Profilim")
 async def my_profile(message: types.Message):
     uid = message.from_user.id
-    prem = "💎 Faol (Premium)" if is_premium(uid) else "🆓 Oddiy tarif"
-    await message.answer(f"👤 <b>Profilingiz:</b>\n🆔 ID: <code>{uid}</code>\n⭐ Holat: <b>{prem}</b>", parse_mode="HTML")
+    u = ensure_user(uid, message.from_user.full_name)
+    prem = "💎 VIP a’zo" if is_premium(uid) else "🆓 Oddiy a’zo"
+    await message.answer(f"👤 <b>{u['name']}</b>\n⭐ Holat: <b>{prem}</b>\n👥 Takliflar: <b>{len(u.get('refs', []))}/5</b>\n🔗 Havola: <code>https://t.me/{BOT_USERNAME}?start=ref_{uid}</code>", parse_mode="HTML")
 
 
-@dp.message(F.text == "📝 Kino zakaz qilish")
+@dp.message(F.text == "📝 Kino zakaz")
 async def order_movie_start(message: types.Message, state: FSMContext):
     await state.set_state(AdminStates.wait_order)
-    await message.answer("📝 Qaysi kino yoki serialni qo‘shishimizni xohlaysiz? Nomi va yilini yozib yuboring:")
+    await message.answer("📝 Qaysi kino yoki serialni qo‘shishimizni xohlaysiz? Nomi va yilini yozing:")
 
 
 @dp.message(AdminStates.wait_order, F.text)
@@ -208,12 +271,12 @@ async def order_movie_receive(message: types.Message, state: FSMContext):
     await message.answer("✅ Buyurtmangiz adminga yuborildi!")
 
 
-@dp.message(F.text == "💎 Premium")
+@dp.message(F.text == "💎 VIP / Premium")
 async def premium_info(message: types.Message, state: FSMContext = None):
     if state:
         await state.clear()
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💳 Sotib olish (Chek yuborish)", callback_data="buy_premium")]])
-    await message.answer(f"💎 <b>Filmora Premium</b>\n💰 Narxi: <b>{DB['settings']['price']}</b>\n💳 Karta:\n<code>{DB['settings']['card']}</code>\n\nTo‘lov qilgach chek rasmini yuboring:", parse_mode="HTML", reply_markup=kb)
+    await message.answer(f"💎 <b>FILMORA VIP</b>\n💰 Narxi: <b>{DB['settings']['price']}</b>\n💳 Karta:\n<code>{DB['settings']['card']}</code>\n\nTo‘lov qilgach chek rasmini yuboring:", parse_mode="HTML", reply_markup=kb)
 
 
 @dp.callback_query(F.data == "buy_premium")
@@ -228,7 +291,7 @@ async def receive_receipt(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Tasdiqlash (30 kun)", callback_data=f"approve_prem:{uid}"), InlineKeyboardButton(text="❌ Rad etish", callback_data=f"reject_prem:{uid}")]])
-    await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=f"💳 <b>Yangi chek!</b>\n👤 {message.from_user.full_name}\n🆔 <code>{uid}</code>", parse_mode="HTML", reply_markup=kb)
+    await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=f"💳 <b>Yangi VIP chek!</b>\n👤 {message.from_user.full_name}\n🆔 <code>{uid}</code>", parse_mode="HTML", reply_markup=kb)
     await message.answer("✅ Chekingiz adminga yuborildi!")
 
 
@@ -241,7 +304,7 @@ async def approve_prem_cb(call: types.CallbackQuery):
     await save_db()
     await call.message.edit_caption(caption=call.message.caption + "\n\n✅ <b>TASDIQLANDI</b>", parse_mode="HTML")
     try:
-        await bot.send_message(uid, "🎉 Sizga <b>30 kunlik Premium</b> yoqildi!", parse_mode="HTML")
+        await bot.send_message(uid, "🎉 Sizga <b>30 kunlik VIP</b> yoqildi!", parse_mode="HTML")
     except Exception:
         pass
 
@@ -256,30 +319,80 @@ async def reject_prem_cb(call: types.CallbackQuery):
         await bot.send_message(uid, "❌ To‘lov chekingiz tasdiqlanmadi.")
     except Exception:
         pass
+
+
+@dp.callback_query(F.data.startswith("ep:"))
+async def ep_nav_cb(call: types.CallbackQuery):
+    _, code, ep_s = call.data.split(":")
+    await send_content_to_user(call.from_user.id, code, int(ep_s))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("alleps:"))
+async def all_eps_cb(call: types.CallbackQuery):
+    code = call.data.split(":")[1]
+    m = DB["movies"].get(code)
+    if not m:
+        return
+    btns = [InlineKeyboardButton(text=f"{i}-qism", callback_data=f"ep:{code}:{i}") for i in range(1, len(m.get("episodes", [])) + 1)]
+    await call.message.answer(f"📑 <b>{m['title']}</b> — qismni tanlang:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[btns[i:i + 4] for i in range(0, len(btns), 4)]))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("fav:"))
+async def fav_toggle_cb(call: types.CallbackQuery):
+    code = call.data.split(":")[1]
+    u = ensure_user(call.from_user.id)
+    if code in u["favs"]:
+        u["favs"].remove(code)
+        await save_db()
+        await call.answer("💔 Saralanganlardan olib tashlandi")
+    else:
+        u["favs"].append(code)
+        await save_db()
+        await call.answer("❤️ Saralanganlarga qo‘shildi!")
+
+
+@dp.callback_query(F.data.startswith("subser:"))
+async def sub_series_cb(call: types.CallbackQuery):
+    code = call.data.split(":")[1]
+    u = ensure_user(call.from_user.id)
+    if code in u["subs"]:
+        u["subs"].remove(code)
+        await save_db()
+        await call.answer("🔕 Kuzatish o‘chirildi")
+    else:
+        u["subs"].append(code)
+        await save_db()
+        await call.answer("🔔 Yangi qism chiqsa xabar beramiz!")
+
+
+@dp.callback_query(F.data.startswith("rate:"))
+async def rate_movie_cb(call: types.CallbackQuery):
+    _, code, score_s = call.data.split(":")
+    m = DB["movies"].get(code)
+    if not m:
+        return
+    m.setdefault("votes", []).append(int(score_s))
+    await save_db()
+    await call.answer(f"⭐ {score_s} baho berdingiz! O‘rtacha: {get_rating_str(m)}", show_alert=True)
 @dp.message(Command("panel"))
 @dp.message(F.text == "⚙️ Admin Panel")
 async def open_admin_panel(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     await state.clear()
-    await message.answer("⚙️ <b>Filmora Admin Panel</b>", parse_mode="HTML", reply_markup=admin_panel_kb())
+    await message.answer("⚙️ <b>FILMORA PRO — Admin Panel</b>", parse_mode="HTML", reply_markup=admin_panel_kb())
 
 
-@dp.callback_query(F.data == "adm_add_movie")
-async def adm_add_movie(call: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data.startswith("add_kind:"))
+async def adm_add_kind(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
         return
-    await state.set_state(AdminStates.add_kind)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎬 Kino (1 qismli)", callback_data="kind:movie"), InlineKeyboardButton(text="📺 Serial (ko‘p qismli)", callback_data="kind:series")]])
-    await call.message.answer("1️⃣ Nima qo‘shmoqchisiz?", reply_markup=kb)
-    await call.answer()
-
-
-@dp.callback_query(AdminStates.add_kind, F.data.startswith("kind:"))
-async def adm_set_kind(call: types.CallbackQuery, state: FSMContext):
-    await state.update_data(kind=call.data.split(":")[1], episodes=[])
+    kind = call.data.split(":")[1]
+    await state.update_data(kind=kind)
     await state.set_state(AdminStates.add_code)
-    await call.message.answer("2️⃣ Kodini kiriting (masalan: <code>991</code>):", parse_mode="HTML")
+    await call.message.answer(f"1️⃣ {'Serial' if kind == 'series' else 'Kino'} kodini kiriting (masalan: <code>1</code>):", parse_mode="HTML")
     await call.answer()
 
 
@@ -287,21 +400,35 @@ async def adm_set_kind(call: types.CallbackQuery, state: FSMContext):
 async def adm_add_code(message: types.Message, state: FSMContext):
     await state.update_data(code=message.text.strip())
     await state.set_state(AdminStates.add_title)
-    await message.answer("3️⃣ Nomini kiriting:")
+    await message.answer("2️⃣ Nomini kiriting (masalan: <code>Umar Ibn Hattob</code>):", parse_mode="HTML")
 
 
 @dp.message(AdminStates.add_title)
 async def adm_add_title(message: types.Message, state: FSMContext):
     await state.update_data(title=message.text.strip())
     await state.set_state(AdminStates.add_year)
-    await message.answer("4️⃣ Yili va janrini kiriting (masalan: <code>2025 • Jangari</code>):", parse_mode="HTML")
+    await message.answer("3️⃣ Yilini kiriting (masalan: <code>2012</code>):", parse_mode="HTML")
 
 
 @dp.message(AdminStates.add_year)
 async def adm_add_year(message: types.Message, state: FSMContext):
     await state.update_data(year=message.text.strip())
+    await state.set_state(AdminStates.add_genre)
+    await message.answer("4️⃣ Janrini kiriting (masalan: <code>Tarixiy, Drama</code>):", parse_mode="HTML")
+
+
+@dp.message(AdminStates.add_genre)
+async def adm_add_genre(message: types.Message, state: FSMContext):
+    await state.update_data(genre=message.text.strip())
+    await state.set_state(AdminStates.add_country)
+    await message.answer("5️⃣ Davlatini kiriting (masalan: <code>Qatar, BAA</code>):", parse_mode="HTML")
+
+
+@dp.message(AdminStates.add_country)
+async def adm_add_country(message: types.Message, state: FSMContext):
+    await state.update_data(country=message.text.strip())
     await state.set_state(AdminStates.add_poster)
-    await message.answer("5️⃣ Poster rasmini yuboring (galereyadan rasm yoki havola):")
+    await message.answer("6️⃣ Poster rasmini yuboring (galereyadan rasm yoki havola):")
 
 
 @dp.message(AdminStates.add_poster)
@@ -314,19 +441,18 @@ async def adm_add_poster(message: types.Message, state: FSMContext):
         poster = "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500&q=80"
     await state.update_data(poster=poster)
     await state.set_state(AdminStates.add_premium)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎬 Oddiy (Bepul)", callback_data="set_mtype:free"), InlineKeyboardButton(text="💎 Premium", callback_data="set_mtype:prem")]])
-    await message.answer("6️⃣ Turini tanlang:", reply_markup=kb)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎬 Oddiy Kino", callback_data="mcat:movie:free"), InlineKeyboardButton(text="🧸 Multfilm", callback_data="mcat:cartoon:free")], [InlineKeyboardButton(text="💎 VIP (Pullik)", callback_data="mcat:same:prem")]])
+    await message.answer("7️⃣ Toifasini tanlang:", reply_markup=kb)
 
 
-@dp.callback_query(AdminStates.add_premium, F.data.startswith("set_mtype:"))
-async def adm_set_mtype(call: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(AdminStates.add_premium, F.data.startswith("mcat:"))
+async def adm_set_mcat(call: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    await state.update_data(premium=(call.data.split(":")[1] == "prem"))
+    _, sub_type, tier = call.data.split(":")
+    final_type = "series" if data["kind"] == "series" else ("cartoon" if sub_type == "cartoon" else "movie")
+    await state.update_data(final_type=final_type, premium=(tier == "prem"))
     await state.set_state(AdminStates.add_video)
-    if data["kind"] == "series":
-        await call.message.answer("7️⃣ Serialning <b>1-qism</b> videosini yuboring (keyin 2, 3... qismlarni ketma-ket tashlaysiz):", parse_mode="HTML")
-    else:
-        await call.message.answer("7️⃣ Endi <b>kino videosini</b> yuboring:", parse_mode="HTML")
+    await call.message.answer("8️⃣ Endi <b>1-qism videosini</b> yuboring:" if final_type == "series" else "8️⃣ Endi <b>videosini</b> yuboring:", parse_mode="HTML")
     await call.answer()
 
 
@@ -334,34 +460,21 @@ async def adm_set_mtype(call: types.CallbackQuery, state: FSMContext):
 async def adm_save_video(message: types.Message, state: FSMContext):
     data = await state.get_data()
     sent = await bot.copy_message(BAZA_CHANNEL_ID, message.chat.id, message.message_id)
-    episodes = data.get("episodes", [])
-    episodes.append(sent.message_id)
-    await state.update_data(episodes=episodes)
-    if data["kind"] == "movie":
-        DB["movies"][data["code"]] = {"episodes": episodes, "title": data["title"], "year": data["year"], "poster": data["poster"], "type": "movie", "premium": data["premium"]}
-        await save_db()
-        await state.clear()
-        await message.answer(f"✅ Kino <b>{data['title']}</b> (Kod: <code>{data['code']}</code>) saqlandi!", parse_mode="HTML", reply_markup=admin_panel_kb())
-    else:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"✅ Saqlash ({len(episodes)} ta qism)", callback_data="finish_series")]])
-        await message.answer(f"✅ <b>{len(episodes)}-qism</b> qabul qilindi!\nKeyingi qism videosini tashlang yoki tugatish uchun pastdagi tugmani bosing:", parse_mode="HTML", reply_markup=kb)
-
-
-@dp.callback_query(AdminStates.add_video, F.data == "finish_series")
-async def finish_series_cb(call: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    episodes = data.get("episodes", [])
-    DB["movies"][data["code"]] = {"episodes": episodes, "title": data["title"], "year": data["year"], "poster": data["poster"], "type": "series", "premium": data["premium"]}
+    DB["movies"][data["code"]] = {
+        "episodes": [sent.message_id], "title": data["title"], "year": data["year"], "genre": data["genre"],
+        "country": data["country"], "poster": data["poster"], "type": data["final_type"], "premium": data["premium"],
+        "views": 0, "ep_views": {"1": 0}, "votes": [], "created_at": int(time.time()),
+    }
     await save_db()
     await state.clear()
-    await call.message.answer(f"✅ Serial <b>{data['title']}</b> ({len(episodes)} ta qism, Kod: <code>{data['code']}</code>) saqlandi!", parse_mode="HTML", reply_markup=admin_panel_kb())
-    await call.answer()
+    msg = f"✅ <b>{data['title']}</b> (Kod: <code>{data['code']}</code>) <b>1-qism</b> bilan joylandi!\nKeyingi qismlarni <b>➕ Qism joylash</b> orqali qo‘shasiz." if data["final_type"] == "series" else f"✅ <b>{data['title']}</b> (Kod: <code>{data['code']}</code>) joylandi!"
+    await message.answer(msg, parse_mode="HTML", reply_markup=admin_panel_kb())
 
 
 @dp.callback_query(F.data == "adm_add_ep")
 async def adm_add_ep(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.ep_code)
-    await call.message.answer("📺 Yangi qism qo‘shiladigan serial kodini yuboring:")
+    await call.message.answer("➕ Qaysi serialga qism qo‘shmoqchisiz? <b>Serial kodini</b> yuboring:", parse_mode="HTML")
     await call.answer()
 
 
@@ -375,7 +488,7 @@ async def adm_ep_code(message: types.Message, state: FSMContext):
     await state.update_data(code=code)
     await state.set_state(AdminStates.ep_video)
     cur = len(DB["movies"][code].get("episodes", []))
-    await message.answer(f"🎬 <b>{DB['movies'][code]['title']}</b> (hozir {cur} ta qism bor).\nEndi <b>{cur + 1}-qism</b> videosini yuboring:", parse_mode="HTML")
+    await message.answer(f"📺 <b>{DB['movies'][code]['title']}</b> (hozir {cur} ta qism bor).\nEndi <b>{cur + 1}-qism</b> videosini yuboring:", parse_mode="HTML")
 
 
 @dp.message(AdminStates.ep_video, F.video | F.document)
@@ -383,12 +496,21 @@ async def adm_ep_video(message: types.Message, state: FSMContext):
     data = await state.get_data()
     code = data["code"]
     sent = await bot.copy_message(BAZA_CHANNEL_ID, message.chat.id, message.message_id)
-    DB["movies"][code].setdefault("episodes", []).append(sent.message_id)
-    DB["movies"][code]["type"] = "series"
+    m = DB["movies"][code]
+    m.setdefault("episodes", []).append(sent.message_id)
+    m["type"] = "series"
+    ep_num = len(m["episodes"])
+    m.setdefault("ep_views", {})[str(ep_num)] = 0
     await save_db()
     await state.clear()
-    total = len(DB["movies"][code]["episodes"])
-    await message.answer(f"✅ <b>{total}-qism</b> muvaffaqiyatli qo‘shildi!", parse_mode="HTML", reply_markup=admin_panel_kb())
+    await message.answer(f"✅ <b>{m['title']}</b> — <b>{ep_num}-qism</b> joylandi!", parse_mode="HTML", reply_markup=admin_panel_kb())
+    for suid, udata in DB["users"].items():
+        if code in udata.get("subs", []):
+            try:
+                kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"▶️ {ep_num}-qismni ko‘rish", callback_data=f"ep:{code}:{ep_num}")]])
+                await bot.send_message(int(suid), f"🔔 Siz kuzatayotgan <b>{m['title']}</b> serialining <b>{ep_num}-qismi</b> chiqdi!", parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                pass
 
 
 @dp.callback_query(F.data == "adm_edit_movie")
@@ -406,7 +528,7 @@ async def adm_edit_code_step(message: types.Message, state: FSMContext):
         await state.clear()
         return
     await state.update_data(code=code)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📝 Nomini o‘zgartirish", callback_data="ed_act:title")], [InlineKeyboardButton(text="🔄 Oddiy ↔ Premium", callback_data="ed_act:toggle_prem")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📝 Nomini o‘zgartirish", callback_data="ed_act:title")], [InlineKeyboardButton(text="🔄 Oddiy ↔ VIP", callback_data="ed_act:toggle_prem")]])
     await message.answer(f"🎬 <b>{DB['movies'][code]['title']}</b>", parse_mode="HTML", reply_markup=kb)
 
 
@@ -517,7 +639,7 @@ async def adm_ch_url(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "back_panel")
 async def back_panel_cb(call: types.CallbackQuery):
-    await call.message.edit_text("⚙️ <b>Filmora Admin Panel</b>", parse_mode="HTML", reply_markup=admin_panel_kb())
+    await call.message.edit_text("⚙️ <b>FILMORA PRO — Admin Panel</b>", parse_mode="HTML", reply_markup=admin_panel_kb())
 
 
 @dp.callback_query(F.data == "adm_set_card")
@@ -538,7 +660,7 @@ async def adm_save_card(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "adm_set_price")
 async def adm_set_price(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.set_price)
-    await call.message.answer("💰 Premium narxini kiriting:")
+    await call.message.answer("💰 VIP narxini kiriting:")
     await call.answer()
 
 
@@ -563,14 +685,14 @@ async def adm_give_prem_done(message: types.Message, state: FSMContext):
     if uid.isdigit():
         DB["premium_users"][uid] = int(time.time()) + 30 * 86400
         await save_db()
-        await message.answer(f"✅ <code>{uid}</code> ga Premium berildi!", parse_mode="HTML", reply_markup=admin_panel_kb())
+        await message.answer(f"✅ <code>{uid}</code> ga VIP berildi!", parse_mode="HTML", reply_markup=admin_panel_kb())
     await state.clear()
 
 
 @dp.callback_query(F.data == "adm_stats")
 async def adm_stats(call: types.CallbackQuery):
     active_prem = sum(1 for exp in DB["premium_users"].values() if exp > int(time.time()))
-    await call.message.answer(f"📊 Foydalanuvchilar: <b>{len(DB['users'])}</b>\n💎 Premium: <b>{active_prem}</b>\n🎬 Kinolar/Seriallar: <b>{len(DB['movies'])}</b>", parse_mode="HTML")
+    await call.message.answer(f"📊 Foydalanuvchilar: <b>{len(DB['users'])}</b>\n💎 VIP: <b>{active_prem}</b>\n🎬 Jami kontent: <b>{len(DB['movies'])}</b>", parse_mode="HTML")
     await call.answer()
 
 
@@ -585,9 +707,9 @@ async def adm_broadcast(call: types.CallbackQuery, state: FSMContext):
 async def adm_broadcast_send(message: types.Message, state: FSMContext):
     await state.clear()
     sent = 0
-    for uid in DB["users"]:
+    for suid in DB["users"]:
         try:
-            await bot.copy_message(uid, message.chat.id, message.message_id)
+            await bot.copy_message(int(suid), message.chat.id, message.message_id)
             sent += 1
         except Exception:
             pass
@@ -601,7 +723,8 @@ async def send_movie_by_code(message: types.Message):
     if missing:
         await message.answer("🎬 Kinolarni ko‘rish uchun avval kanallarga obuna bo‘ling:", reply_markup=sub_keyboard(missing))
         return
-    movie = DB["movies"].get(message.text.strip())
+    code = message.text.strip()
+    movie = DB["movies"].get(code)
     if not movie:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎬 Katalogni ochish", web_app=WebAppInfo(url=MINI_APP_URL))]])
         await message.answer("❌ Bunday kodli kino topilmadi:", reply_markup=kb)
@@ -610,7 +733,7 @@ async def send_movie_by_code(message: types.Message):
         await premium_info(message, None)
         return
     try:
-        await deliver_movie(uid, movie)
+        await send_content_to_user(uid, code, 1)
     except Exception:
         await message.answer("⚠️ Yuborishda xatolik.")
 
@@ -618,6 +741,13 @@ async def send_movie_by_code(message: types.Message):
 class WatchRequest(BaseModel):
     user_id: int
     code: str
+    ep: int = 1
+
+
+class ActionRequest(BaseModel):
+    user_id: int
+    code: str
+    score: int = 0
 
 
 @asynccontextmanager
@@ -644,9 +774,63 @@ async def get_poster(file_id: str):
     return RedirectResponse(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}")
 
 
-@app.get("/api/catalog")
-async def api_catalog():
-    return {"items": [{"id": c, "type": m.get("type", "movie"), "title": m["title"], "year": m.get("year", ""), "poster": m.get("poster", ""), "code": c, "premium": m.get("premium", False), "ep_count": len(m.get("episodes", [1]))} for c, m in DB["movies"].items()]}
+@app.get("/api/state")
+async def api_state(user_id: int = 0, name: str = "Foydalanuvchi"):
+    items = []
+    for c, m in DB["movies"].items():
+        votes = m.get("votes", [])
+        avg = round(sum(votes) / len(votes), 1) if votes else 0
+        eps = m.get("episodes", [])
+        items.append({
+            "code": c, "type": m.get("type", "movie"), "title": m["title"], "year": m.get("year", "2026"),
+            "genre": m.get("genre", "Drama"), "country": m.get("country", "AQSH"), "poster": m.get("poster", ""),
+            "premium": m.get("premium", False), "views": m.get("views", 0), "ep_views": m.get("ep_views", {}),
+            "rating": avg, "vote_count": len(votes), "ep_count": len(eps), "created_at": m.get("created_at", 0),
+        })
+    u = ensure_user(user_id, name) if user_id else {"name": name, "favs": [], "subs": [], "history": [], "progress": {}, "refs": []}
+    return {
+        "items": items,
+        "user": {
+            "name": u["name"], "is_vip": is_premium(user_id) if user_id else False, "favs": u["favs"],
+            "subs": u["subs"], "history": u["history"], "progress": u["progress"],
+            "refs_count": len(u.get("refs", [])), "ref_link": f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}",
+        },
+    }
+
+
+@app.post("/api/fav")
+async def api_fav(req: ActionRequest):
+    u = ensure_user(req.user_id)
+    added = req.code not in u["favs"]
+    if added:
+        u["favs"].append(req.code)
+    else:
+        u["favs"].remove(req.code)
+    await save_db()
+    return {"ok": True, "added": added, "favs": u["favs"]}
+
+
+@app.post("/api/sub")
+async def api_sub(req: ActionRequest):
+    u = ensure_user(req.user_id)
+    added = req.code not in u["subs"]
+    if added:
+        u["subs"].append(req.code)
+    else:
+        u["subs"].remove(req.code)
+    await save_db()
+    return {"ok": True, "added": added, "subs": u["subs"]}
+
+
+@app.post("/api/rate")
+async def api_rate(req: ActionRequest):
+    m = DB["movies"].get(req.code)
+    if not m:
+        raise HTTPException(status_code=404, detail="Topilmadi")
+    m.setdefault("votes", []).append(req.score)
+    await save_db()
+    votes = m["votes"]
+    return {"ok": True, "rating": round(sum(votes) / len(votes), 1), "vote_count": len(votes)}
 
 
 @app.post("/api/watch")
@@ -659,11 +843,11 @@ async def api_watch(req: WatchRequest):
     if not movie:
         raise HTTPException(status_code=404, detail="Topilmadi")
     if movie.get("premium") and not is_premium(req.user_id):
-        await bot.send_message(req.user_id, f"💎 <b>{movie['title']}</b> — Premium!", parse_mode="HTML")
+        await bot.send_message(req.user_id, f"💎 <b>{movie['title']}</b> — VIP kontent!", parse_mode="HTML")
         return {"ok": False, "error": "premium_required"}
     try:
-        await deliver_movie(req.user_id, movie)
+        await send_content_to_user(req.user_id, req.code, req.ep)
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
+        

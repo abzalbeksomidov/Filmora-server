@@ -167,7 +167,7 @@ async def send_content_to_user(user_id: int, code: str, ep_idx: int = 1):
     )
     await bot.copy_message(user_id, BAZA_CHANNEL_ID, episodes[ep_idx - 1], caption=caption, parse_mode="HTML", reply_markup=movie_inline_kb(code, m, ep_idx))
 
- class AdminStates(StatesGroup):
+class AdminStates(StatesGroup):
     add_kind = State()
     add_code = State()
     add_title = State()

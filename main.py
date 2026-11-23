@@ -107,7 +107,7 @@ def sub_keyboard(missing_channels):
 
 def main_reply_keyboard(user_id: int):
     kb = [
-        [KeyboardButton(text="🎬 FILMORA PRO (Katalog)"],
+        [KeyboardButton(text="🎬 FILMORA PRO (Katalog)")],
         [KeyboardButton(text="🔎 Kino kodi"), KeyboardButton(text="💎 VIP / Premium")],
         [KeyboardButton(text="📝 Kino zakaz"), KeyboardButton(text="👤 Profilim")],
     ]

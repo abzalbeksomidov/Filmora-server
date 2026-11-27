@@ -674,7 +674,7 @@ async def reject_prem_cb(call: types.CallbackQuery):
         await bot.send_message(uid, "❌ To‘lov chekingiz tasdiqlanmadi.")
     except Exception:
         pass
-        @dp.callback_query(F.data.startswith("ep:"))
+@dp.callback_query(F.data.startswith("ep:"))
 async def ep_nav_cb(call: types.CallbackQuery):
     _, code, ep_s = call.data.split(":")
     await send_content_to_user(call.from_user.id, code, int(ep_s))

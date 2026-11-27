@@ -226,6 +226,24 @@ async def fetch_wiki_poster(query: str) -> str:
     return ""
 
 
+async def fallback_translate_title(text: str, target_lang: str) -> str:
+    if not text:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                "https://translate.googleapis.com/translate_a/single",
+                params={"client": "gtx", "sl": "uz", "tl": target_lang, "dt": "t", "q": text},
+            )
+            if r.status_code == 200:
+                data = r.json()
+                translated = "".join(part[0] for part in data[0] if part and part[0])
+                return clean_movie_query(translated)
+    except Exception as e:
+        print(f"Translate ({target_lang}) error:", e)
+    return ""
+
+
 async def identify_movie_with_gemini(raw_hint: str, parsed: dict) -> dict:
     title_uz = clean_movie_query(parsed.get("title") or raw_hint) or "Kino"
     year = parsed.get("year") or "2024"
@@ -235,8 +253,9 @@ async def identify_movie_with_gemini(raw_hint: str, parsed: dict) -> dict:
         f"{title_uz} ({year}) filmi keskin burilishlar va unutilmas sahnalari bilan "
         f"tomoshabinni ilk daqiqalardanoq o‘ziga tortadi. To‘liq versiyani botimiz orqali hoziroq ko‘ring!"
     )
-    english_query = title_uz
+    english_query = ""
     russian_query = ""
+    ai_success = False
 
     if GEMINI_API_KEY:
         prompt = (
@@ -248,13 +267,20 @@ async def identify_movie_with_gemini(raw_hint: str, parsed: dict) -> dict:
             f'"year": "4 xonali yil", "genre": "Janri o\'zbekcha", "country": "Davlati o\'zbekcha", '
             f'"desc": "Kino haqida o\'zbek tilida 2 gaplik qiziqarli reklama tavsifi"}}'
         )
-        for model_name in ("gemini-3.8-flash", "gemini-2.5-flash"):
+        models_to_try = [
+            "gemini-3.8-flash",
+            "gemini-3.8-flash-lite",
+            "gemini-3.8-flash",
+            "gemini-3.8-flash-lite",
+            "gemini-3.8-flash",
+        ]
+        for idx, model_name in enumerate(models_to_try):
             url = (
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{model_name}:generateContent?key={GEMINI_API_KEY}"
             )
             try:
-                async with httpx.AsyncClient(timeout=20) as client:
+                async with httpx.AsyncClient(timeout=35) as client:
                     resp = await client.post(url, json={"contents": [{"parts": [{"text": prompt}]}]})
                     data = resp.json()
                     if "candidates" in data and data["candidates"]:
@@ -263,17 +289,27 @@ async def identify_movie_with_gemini(raw_hint: str, parsed: dict) -> dict:
                         if m:
                             ai_data = json.loads(m.group(0))
                             title_uz = clean_movie_query(ai_data.get("title_uz")) or title_uz
-                            english_query = clean_movie_query(ai_data.get("english_title")) or title_uz
+                            english_query = clean_movie_query(ai_data.get("english_title"))
                             russian_query = clean_movie_query(ai_data.get("russian_title"))
                             year = str(ai_data.get("year") or year)
                             genre = ai_data.get("genre") or genre
                             country = ai_data.get("country") or country
                             desc = ai_data.get("desc") or desc
+                            ai_success = True
                             break
                     else:
-                        print(f"Gemini ({model_name}) error:", data)
+                        print(f"Gemini ({model_name}) attempt {idx+1}/5 error:", data)
+                        if idx < len(models_to_try) - 1:
+                            await asyncio.sleep(45)
             except Exception as e:
-                print(f"Gemini ({model_name}) exception:", e)
+                print(f"Gemini ({model_name}) attempt {idx+1}/5 exception:", e)
+                if idx < len(models_to_try) - 1:
+                    await asyncio.sleep(45)
+
+    if not ai_success or not english_query:
+        english_query = await fallback_translate_title(title_uz, "en") or title_uz
+    if not russian_query:
+        russian_query = await fallback_translate_title(title_uz, "ru")
 
     print(f"Poster search -> title_uz={title_uz!r}, en={english_query!r}, ru={russian_query!r}, year={year!r}")
     poster = (
@@ -296,10 +332,8 @@ async def identify_movie_with_gemini(raw_hint: str, parsed: dict) -> dict:
         "country": country,
         "desc": desc,
         "poster": poster,
-    }
+            }
             
-        
-    
 
 
 async def publish_next_queued_movie() -> tuple[bool, str]:
@@ -494,6 +528,35 @@ def admin_panel_kb():
     )
 
 
+async def process_backup_movie_bg(backup_msg_id: int, hint: str, parsed: dict):
+    info = await identify_movie_with_gemini(hint, parsed)
+    DB.setdefault("queue", []).append({
+        "backup_msg_id": backup_msg_id,
+        "title": info["title"],
+        "year": info["year"],
+        "genre": info["genre"],
+        "country": info["country"],
+        "desc": info["desc"],
+        "poster": info["poster"],
+    })
+    await save_db()
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"📥 <b>Avto-navbatga qo‘shildi!</b>\n\n"
+            f"🎬 <b>Nomi:</b> {info['title']} ({info['year']})\n"
+            f"🎭 <b>Janr:</b> {info['genre']}\n"
+            f"🖼 <b>Poster:</b> {'✅ Asl poster topildi' if 'unsplash.com' not in info['poster'] else '⚠️ Standart rasm'}\n"
+            f"⏳ <b>Navbatda jami:</b> {len(DB['queue'])} ta",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="▶️ Hoziroq kanalga chiqarish", callback_data="adm_pub_now")
+            ]]),
+        )
+    except Exception:
+        pass
+
+
 @dp.channel_post(F.chat.id == BACKUP_CHANNEL_ID)
 async def backup_channel_watcher(message: types.Message):
     media = message.video or message.document
@@ -518,31 +581,18 @@ async def backup_channel_watcher(message: types.Message):
         return
 
     hint = raw_caption if raw_caption else os.path.splitext(fname)[0]
-    info = await identify_movie_with_gemini(hint, parsed)
-    DB.setdefault("queue", []).append({
-        "backup_msg_id": message.message_id,
-        "title": info["title"],
-        "year": info["year"],
-        "genre": info["genre"],
-        "country": info["country"],
-        "desc": info["desc"],
-        "poster": info["poster"],
-    })
-    await save_db()
     try:
         await bot.send_message(
             ADMIN_ID,
-            f"📥 <b>Avto-navbatga qo‘shildi!</b>\n\n"
-            f"🎬 <b>Nomi:</b> {info['title']} ({info['year']})\n"
-            f"🎭 <b>Janr:</b> {info['genre']}\n"
-            f"⏳ <b>Navbatda jami:</b> {len(DB['queue'])} ta",
+            f"⏳ <b>Yangi kino qabul qilindi!</b>\n"
+            f"3 daqiqagacha vaqt ichida asl poster va tavsif tayyorlanib navbatga qo‘shiladi...",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="▶️ Hoziroq kanalga chiqarish", callback_data="adm_pub_now")
-            ]]),
         )
     except Exception:
         pass
+    asyncio.create_task(process_backup_movie_bg(message.message_id, hint, parsed))
+        
+    
 
 
 @dp.message(CommandStart())
@@ -754,13 +804,50 @@ async def adm_queue_cb(call: types.CallbackQuery):
     await call.answer()
 
 
+async def publish_next_bg(chat_id: int):
+    if DB.get("queue"):
+        first = DB["queue"][0]
+        if not first.get("poster") or "unsplash.com" in first.get("poster", ""):
+            refreshed = await identify_movie_with_gemini(
+                f"{first.get('title', '')} {first.get('year', '')}",
+                {
+                    "title": first.get("title", ""),
+                    "year": first.get("year", ""),
+                    "genre": first.get("genre", ""),
+                    "country": first.get("country", ""),
+                },
+            )
+            first.update({
+                "title": refreshed["title"],
+                "year": refreshed["year"],
+                "genre": refreshed["genre"],
+                "country": refreshed["country"],
+                "desc": refreshed["desc"],
+                "poster": refreshed["poster"],
+            })
+            await save_db()
+
+    ok, msg = await publish_next_queued_movie()
+    try:
+        await bot.send_message(chat_id, msg, parse_mode="HTML")
+    except Exception:
+        pass
+
+
 @dp.callback_query(F.data == "adm_pub_now")
 async def adm_pub_now_cb(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         return
-    await call.answer("⏳ Kanalga reklama tayyorlanmoqda...", show_alert=False)
-    ok, msg = await publish_next_queued_movie()
-    await call.message.answer(msg, parse_mode="HTML")
+    if not DB.get("queue"):
+        await call.answer("Navbatda kino yo‘q!", show_alert=True)
+        return
+    await call.answer("⏳ 3 daqiqagacha tayyorlanib kanalga joylanadi!", show_alert=True)
+    await call.message.answer(
+        "⏳ <b>Kino tahlil qilinmoqda...</b>\n3 daqiqa ichida tayyor bo‘lib kanalga joylanadi!",
+        parse_mode="HTML",
+    )
+    asyncio.create_task(publish_next_bg(call.message.chat.id))
+                
 
 
 @dp.callback_query(F.data == "adm_toggle_auto")

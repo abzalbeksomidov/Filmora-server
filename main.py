@@ -367,7 +367,7 @@ async def on_backup_channel_post(message: types.Message):
             PENDING_NAME_PROMPTS[ask_msg.message_id] = message.message_id
         except Exception:
             pass
-           def is_premium(user_id: int) -> bool:
+def is_premium(user_id: int) -> bool:
     return user_id == ADMIN_ID or DB["premium_users"].get(str(user_id), 0) > int(time.time())
 
 

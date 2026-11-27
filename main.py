@@ -155,26 +155,36 @@ async def fetch_itunes_poster(search_query: str) -> str:
             results = r.json().get("results", [])
             if results and results[0].get("artworkUrl100"):
                 return results[0]["artworkUrl100"].replace("100x100bb", "600x900bb")
-    except Exception:
-        pass
+    except Exception as e:
+        print("iTunes error:", e)
     return ""
 
 
 async def fetch_tmdb_poster(title: str, year: str = "") -> str:
     if not TMDB_API_KEY or not title:
+        print("TMDB skipped: key or title empty")
         return ""
     try:
-        params = {"api_key": TMDB_API_KEY, "query": title}
-        if year and year.isdigit():
-            params["year"] = year
         async with httpx.AsyncClient(timeout=12) as client:
-            r = await client.get("https://api.themoviedb.org/3/search/movie", params=params)
-            results = r.json().get("results", [])
-            for item in results:
-                if item.get("poster_path"):
-                    return f"https://image.tmdb.org/t/p/w500{item['poster_path']}"
-    except Exception:
-        pass
+            for lang in ("en-US", "ru-RU"):
+                params = {"api_key": TMDB_API_KEY, "query": title, "language": lang}
+                if year and year.isdigit():
+                    params["year"] = year
+                r = await client.get("https://api.themoviedb.org/3/search/movie", params=params)
+                data = r.json()
+                if data.get("status_message"):
+                    print("TMDB API message:", data.get("status_message"))
+                for item in data.get("results", []):
+                    if item.get("poster_path"):
+                        return f"https://image.tmdb.org/t/p/w500{item['poster_path']}"
+                if "year" in params:
+                    del params["year"]
+                    r2 = await client.get("https://api.themoviedb.org/3/search/movie", params=params)
+                    for item in r2.json().get("results", []):
+                        if item.get("poster_path"):
+                            return f"https://image.tmdb.org/t/p/w500{item['poster_path']}"
+    except Exception as e:
+        print("TMDB error:", e)
     return ""
 
 
@@ -201,8 +211,8 @@ async def fetch_wiki_poster(query: str) -> str:
                 thumb = p.get("thumbnail", {}).get("source")
                 if thumb and thumb.startswith("http"):
                     return thumb
-    except Exception:
-        pass
+    except Exception as e:
+        print("Wiki error:", e)
     return ""
 
 
@@ -234,27 +244,33 @@ async def identify_movie_with_gemini(raw_hint: str, parsed: dict) -> dict:
             async with httpx.AsyncClient(timeout=20) as client:
                 resp = await client.post(url, json={"contents": [{"parts": [{"text": prompt}]}]})
                 data = resp.json()
-                text_out = data["candidates"][0]["content"]["parts"][0]["text"]
-                m = re.search(r"\{.*\}", text_out, re.S)
-                if m:
-                    ai_data = json.loads(m.group(0))
-                    title_uz = ai_data.get("title_uz") or title_uz
-                    english_query = ai_data.get("english_title") or title_uz
-                    year = str(ai_data.get("year") or year)
-                    genre = ai_data.get("genre") or genre
-                    country = ai_data.get("country") or country
-                    desc = ai_data.get("desc") or desc
+                if "candidates" in data and data["candidates"]:
+                    text_out = data["candidates"][0]["content"]["parts"][0]["text"]
+                    m = re.search(r"\{.*\}", text_out, re.S)
+                    if m:
+                        ai_data = json.loads(m.group(0))
+                        title_uz = ai_data.get("title_uz") or title_uz
+                        english_query = ai_data.get("english_title") or title_uz
+                        year = str(ai_data.get("year") or year)
+                        genre = ai_data.get("genre") or genre
+                        country = ai_data.get("country") or country
+                        desc = ai_data.get("desc") or desc
+                else:
+                    print("Gemini error response:", data)
         except Exception as e:
-            print("Gemini error:", e)
+            print("Gemini exception:", e)
 
+    print(f"Poster search -> raw={raw_hint!r}, title_uz={title_uz!r}, english={english_query!r}, year={year!r}")
     poster = (
         await fetch_tmdb_poster(english_query, year)
+        or await fetch_tmdb_poster(title_uz, year)
         or await fetch_itunes_poster(f"{english_query} {year}")
         or await fetch_itunes_poster(english_query)
         or await fetch_wiki_poster(f"{english_query} {year}")
         or await fetch_itunes_poster(title_uz)
     )
     if not poster:
+        print("Poster fallback used!")
         poster = "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500&q=80"
 
     return {
@@ -264,7 +280,8 @@ async def identify_movie_with_gemini(raw_hint: str, parsed: dict) -> dict:
         "country": country,
         "desc": desc,
         "poster": poster,
-    }
+}
+        
     
 
 

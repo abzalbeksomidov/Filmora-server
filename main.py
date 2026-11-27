@@ -142,15 +142,24 @@ def is_junk_filename(fname: str) -> bool:
         return True
     return bool(re.match(r'^(VID|MOV|IMG|VIDEO|FILE|DOC|MP4|HD|FULL|NEW|KINO|FILM)[\s_\-\d]*$', base, re.I))
 
+def clean_movie_query(text: str) -> str:
+    if not text:
+        return ""
+    s = re.sub(r"^(?:🎬|🎥|🎞)?\s*(?:film\s*nomi|kino\s*nomi|nomi)\s*[:\-–]\s*", "", text, flags=re.I)
+    s = re.sub(r"\(\s*\d{4}\s*\)", "", s)
+    s = re.sub(r"[\"'«»“”]", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
 
 async def fetch_itunes_poster(search_query: str) -> str:
-    if not search_query:
+    q = clean_movie_query(search_query)
+    if not q:
         return ""
     try:
         async with httpx.AsyncClient(timeout=12) as client:
             r = await client.get(
                 "https://itunes.apple.com/search",
-                params={"term": search_query, "media": "movie", "limit": 5},
+                params={"term": q, "media": "movie", "limit": 5},
             )
             results = r.json().get("results", [])
             if results and results[0].get("artworkUrl100"):
@@ -161,19 +170,17 @@ async def fetch_itunes_poster(search_query: str) -> str:
 
 
 async def fetch_tmdb_poster(title: str, year: str = "") -> str:
-    if not TMDB_API_KEY or not title:
-        print("TMDB skipped: key or title empty")
+    q = clean_movie_query(title)
+    if not TMDB_API_KEY or not q:
         return ""
     try:
         async with httpx.AsyncClient(timeout=12) as client:
             for lang in ("en-US", "ru-RU"):
-                params = {"api_key": TMDB_API_KEY, "query": title, "language": lang}
+                params = {"api_key": TMDB_API_KEY, "query": q, "language": lang}
                 if year and year.isdigit():
                     params["year"] = year
                 r = await client.get("https://api.themoviedb.org/3/search/movie", params=params)
                 data = r.json()
-                if data.get("status_message"):
-                    print("TMDB API message:", data.get("status_message"))
                 for item in data.get("results", []):
                     if item.get("poster_path"):
                         return f"https://image.tmdb.org/t/p/w500{item['poster_path']}"
@@ -189,16 +196,18 @@ async def fetch_tmdb_poster(title: str, year: str = "") -> str:
 
 
 async def fetch_wiki_poster(query: str) -> str:
-    if not query:
+    q = clean_movie_query(query)
+    if not q:
         return ""
+    headers = {"User-Agent": "FilmoraBot/1.0 (https://t.me/filmora_kinolar; contact@filmora.uz)"}
     try:
-        async with httpx.AsyncClient(timeout=12, headers={"User-Agent": "FilmoraBot/1.0"}) as client:
+        async with httpx.AsyncClient(timeout=12, headers=headers) as client:
             r = await client.get(
                 "https://en.wikipedia.org/w/api.php",
                 params={
                     "action": "query",
                     "generator": "search",
-                    "gsrsearch": f"{query} film poster",
+                    "gsrsearch": f"{q} film",
                     "gsrlimit": 3,
                     "prop": "pageimages",
                     "piprop": "thumbnail",
@@ -206,18 +215,19 @@ async def fetch_wiki_poster(query: str) -> str:
                     "format": "json",
                 },
             )
-            pages = r.json().get("query", {}).get("pages", {})
-            for p in pages.values():
-                thumb = p.get("thumbnail", {}).get("source")
-                if thumb and thumb.startswith("http"):
-                    return thumb
+            if r.status_code == 200 and r.text.strip().startswith("{"):
+                pages = r.json().get("query", {}).get("pages", {})
+                for p in pages.values():
+                    thumb = p.get("thumbnail", {}).get("source")
+                    if thumb and thumb.startswith("http"):
+                        return thumb
     except Exception as e:
         print("Wiki error:", e)
     return ""
 
 
 async def identify_movie_with_gemini(raw_hint: str, parsed: dict) -> dict:
-    title_uz = parsed.get("title") or raw_hint
+    title_uz = clean_movie_query(parsed.get("title") or raw_hint) or "Kino"
     year = parsed.get("year") or "2024"
     genre = parsed.get("genre") or "Jangari, Drama"
     country = parsed.get("country") or "AQSH"
@@ -226,6 +236,7 @@ async def identify_movie_with_gemini(raw_hint: str, parsed: dict) -> dict:
         f"tomoshabinni ilk daqiqalardanoq o‘ziga tortadi. To‘liq versiyani botimiz orqali hoziroq ko‘ring!"
     )
     english_query = title_uz
+    russian_query = ""
 
     if GEMINI_API_KEY:
         prompt = (
@@ -233,36 +244,41 @@ async def identify_movie_with_gemini(raw_hint: str, parsed: dict) -> dict:
             f"Matn: {raw_hint}\nAjratilgan nom: {title_uz}, Yil: {year}, Davlat: {country}, Janr: {genre}\n\n"
             f"Faqat quyidagi JSON formatda javob ber (boshqa hech narsa yozma):\n"
             f'{{"title_uz": "O\'zbekcha aniq nomi", "english_title": "Exact original or English movie title", '
+            f'"russian_title": "Точное русское название фильма", '
             f'"year": "4 xonali yil", "genre": "Janri o\'zbekcha", "country": "Davlati o\'zbekcha", '
             f'"desc": "Kino haqida o\'zbek tilida 2 gaplik qiziqarli reklama tavsifi"}}'
         )
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-        )
-        try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                resp = await client.post(url, json={"contents": [{"parts": [{"text": prompt}]}]})
-                data = resp.json()
-                if "candidates" in data and data["candidates"]:
-                    text_out = data["candidates"][0]["content"]["parts"][0]["text"]
-                    m = re.search(r"\{.*\}", text_out, re.S)
-                    if m:
-                        ai_data = json.loads(m.group(0))
-                        title_uz = ai_data.get("title_uz") or title_uz
-                        english_query = ai_data.get("english_title") or title_uz
-                        year = str(ai_data.get("year") or year)
-                        genre = ai_data.get("genre") or genre
-                        country = ai_data.get("country") or country
-                        desc = ai_data.get("desc") or desc
-                else:
-                    print("Gemini error response:", data)
-        except Exception as e:
-            print("Gemini exception:", e)
+        for model_name in ("gemini-3.8-flash", "gemini-2.5-flash"):
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model_name}:generateContent?key={GEMINI_API_KEY}"
+            )
+            try:
+                async with httpx.AsyncClient(timeout=20) as client:
+                    resp = await client.post(url, json={"contents": [{"parts": [{"text": prompt}]}]})
+                    data = resp.json()
+                    if "candidates" in data and data["candidates"]:
+                        text_out = data["candidates"][0]["content"]["parts"][0]["text"]
+                        m = re.search(r"\{.*\}", text_out, re.S)
+                        if m:
+                            ai_data = json.loads(m.group(0))
+                            title_uz = clean_movie_query(ai_data.get("title_uz")) or title_uz
+                            english_query = clean_movie_query(ai_data.get("english_title")) or title_uz
+                            russian_query = clean_movie_query(ai_data.get("russian_title"))
+                            year = str(ai_data.get("year") or year)
+                            genre = ai_data.get("genre") or genre
+                            country = ai_data.get("country") or country
+                            desc = ai_data.get("desc") or desc
+                            break
+                    else:
+                        print(f"Gemini ({model_name}) error:", data)
+            except Exception as e:
+                print(f"Gemini ({model_name}) exception:", e)
 
-    print(f"Poster search -> raw={raw_hint!r}, title_uz={title_uz!r}, english={english_query!r}, year={year!r}")
+    print(f"Poster search -> title_uz={title_uz!r}, en={english_query!r}, ru={russian_query!r}, year={year!r}")
     poster = (
         await fetch_tmdb_poster(english_query, year)
+        or await fetch_tmdb_poster(russian_query, year)
         or await fetch_tmdb_poster(title_uz, year)
         or await fetch_itunes_poster(f"{english_query} {year}")
         or await fetch_itunes_poster(english_query)
@@ -280,7 +296,8 @@ async def identify_movie_with_gemini(raw_hint: str, parsed: dict) -> dict:
         "country": country,
         "desc": desc,
         "poster": poster,
-}
+    }
+            
         
     
 

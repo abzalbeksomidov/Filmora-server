@@ -26,6 +26,7 @@ from aiogram.types import (
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 ADMIN_ID = 6248171499
 BAZA_CHANNEL_ID = -1003958730565
 BACKUP_CHANNEL_ID = -1005905529010
@@ -257,30 +258,61 @@ async def identify_movie_with_gemini(raw_hint: str, parsed: dict) -> dict:
     russian_query = ""
     ai_success = False
 
-    if GEMINI_API_KEY:
-        prompt = (
-            f"Quyidagi ma'lumot asosida filmni aniqla:\n"
-            f"Matn: {raw_hint}\nAjratilgan nom: {title_uz}, Yil: {year}, Davlat: {country}, Janr: {genre}\n\n"
-            f"Faqat quyidagi JSON formatda javob ber (boshqa hech narsa yozma):\n"
-            f'{{"title_uz": "O\'zbekcha aniq nomi", "english_title": "Exact original or English movie title", '
-            f'"russian_title": "Точное русское название фильма", '
-            f'"year": "4 xonali yil", "genre": "Janri o\'zbekcha", "country": "Davlati o\'zbekcha", '
-            f'"desc": "Kino haqida o\'zbek tilida 2 gaplik qiziqarli reklama tavsifi"}}'
-        )
-        models_to_try = [
-            "gemini-3.8-flash",
-            "gemini-3.8-flash-lite",
-            "gemini-3.8-flash",
-            "gemini-3.8-flash-lite",
-            "gemini-3.8-flash",
-        ]
-        for idx, model_name in enumerate(models_to_try):
+    prompt = (
+        f"Quyidagi ma'lumot asosida filmni aniqla:\n"
+        f"Matn: {raw_hint}\nAjratilgan nom: {title_uz}, Yil: {year}, Davlat: {country}, Janr: {genre}\n\n"
+        f"Faqat quyidagi JSON formatda javob ber (boshqa hech narsa yozma):\n"
+        f'{{"title_uz": "O\'zbekcha aniq nomi", "english_title": "Exact original or English movie title", '
+        f'"russian_title": "Точное русское название фильма", '
+        f'"year": "4 xonali yil", "genre": "Janri o\'zbekcha", "country": "Davlati o\'zbekcha", '
+        f'"desc": "Kino haqida o\'zbek tilida 2 gaplik qiziqarli reklama tavsifi"}}'
+    )
+
+    # 1. GROQ (Asosiy va eng tezkor AI)
+    if GROQ_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {GROQ_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "llama-3.3-70b-versatile",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.2,
+                    },
+                )
+                data = resp.json()
+                if "choices" in data and data["choices"]:
+                    text_out = data["choices"][0]["message"]["content"]
+                    m = re.search(r"\{.*\}", text_out, re.S)
+                    if m:
+                        ai_data = json.loads(m.group(0))
+                        title_uz = clean_movie_query(ai_data.get("title_uz")) or title_uz
+                        english_query = clean_movie_query(ai_data.get("english_title"))
+                        russian_query = clean_movie_query(ai_data.get("russian_title"))
+                        year = str(ai_data.get("year") or year)
+                        genre = ai_data.get("genre") or genre
+                        country = ai_data.get("country") or country
+                        desc = ai_data.get("desc") or desc
+                        ai_success = True
+                        print("Groq AI success!")
+                else:
+                    print("Groq error:", data)
+        except Exception as e:
+            print("Groq exception:", e)
+
+    # 2. GEMINI (Zaxira AI)
+    if not ai_success and GEMINI_API_KEY:
+        for model_name in ("gemini-3.8-flash", "gemini-2.0-flash"):
             url = (
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{model_name}:generateContent?key={GEMINI_API_KEY}"
             )
             try:
-                async with httpx.AsyncClient(timeout=35) as client:
+                async with httpx.AsyncClient(timeout=20) as client:
                     resp = await client.post(url, json={"contents": [{"parts": [{"text": prompt}]}]})
                     data = resp.json()
                     if "candidates" in data and data["candidates"]:
@@ -297,15 +329,10 @@ async def identify_movie_with_gemini(raw_hint: str, parsed: dict) -> dict:
                             desc = ai_data.get("desc") or desc
                             ai_success = True
                             break
-                    else:
-                        print(f"Gemini ({model_name}) attempt {idx+1}/5 error:", data)
-                        if idx < len(models_to_try) - 1:
-                            await asyncio.sleep(45)
             except Exception as e:
-                print(f"Gemini ({model_name}) attempt {idx+1}/5 exception:", e)
-                if idx < len(models_to_try) - 1:
-                    await asyncio.sleep(45)
+                print(f"Gemini ({model_name}) exception:", e)
 
+    # 3. TARJIMON ZAXIRASI
     if not ai_success or not english_query:
         english_query = await fallback_translate_title(title_uz, "en") or title_uz
     if not russian_query:
@@ -332,7 +359,8 @@ async def identify_movie_with_gemini(raw_hint: str, parsed: dict) -> dict:
         "country": country,
         "desc": desc,
         "poster": poster,
-            }
+    }
+    
             
 
 

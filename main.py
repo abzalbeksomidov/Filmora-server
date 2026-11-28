@@ -1,15 +1,351 @@
+"""
+FILMORA avtomatik import moduli.
+
+Zaxira kanalga kino tashlansa:
+  1) caption / fayl nomidan reklama va keraksiz so'zlar tozalanadi
+  2) Claude kino nomi va yilini ajratadi
+  3) TMDB dan janr, davlat, reyting, tavsif va VERTIKAL poster olinadi
+  4) kino botning bazasiga qo'shiladi (mini app o'zi ko'radi)
+  5) reklama kanalga poster + ma'lumot + "Ko'rish" tugmasi bilan post chiqadi
+
+Kerakli environment o'zgaruvchilar (Render -> Environment):
+  RESERVE_CHANNEL_ID   zaxira kanal ID si (masalan -1001234567890)
+  AD_CHANNEL_ID        reklama kanal ID si yoki @username
+  TMDB_API_KEY         themoviedb.org dan
+  ANTHROPIC_API_KEY    console.anthropic.com dan (bo'lmasa oddiy regex ishlaydi)
+"""
 import os
 import re
+import json
+import time
+import html
+import asyncio
+
+import httpx
+from aiogram import F, types
+from aiogram.exceptions import TelegramRetryAfter
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+try:
+    from anthropic import AsyncAnthropic
+except Exception:  # anthropic o'rnatilmagan bo'lsa ham bot ishlayveradi
+    AsyncAnthropic = None
+
+RESERVE_ID = int(os.getenv("RESERVE_CHANNEL_ID", "0") or 0)
+AD_CHANNEL = os.getenv("AD_CHANNEL_ID", "").strip()
+TMDB_KEY = os.getenv("TMDB_API_KEY", "").strip()
+ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+AI_MODEL = "claude-haiku-5-5"
+DELAY = 4  # postlar orasidagi kutish (soniya), Telegram limitidan oshmaslik uchun
+DEFAULT_POSTER = "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500&q=80"
+
+GENRES_UZ = {
+    28: "Jangari", 12: "Sarguzasht", 16: "Multfilm", 35: "Komediya", 80: "Kriminal",
+    99: "Hujjatli", 18: "Drama", 10751: "Oilaviy", 14: "Fantastika", 36: "Tarixiy",
+    27: "Qo‘rqinchli", 10402: "Musiqiy", 9648: "Detektiv", 10749: "Melodrama",
+    878: "Ilmiy-fantastika", 10770: "Teleserial", 53: "Triller", 10752: "Harbiy", 37: "Vestern",
+}
+COUNTRIES_UZ = {
+    "US": "AQSH", "GB": "Buyuk Britaniya", "RU": "Rossiya", "TR": "Turkiya", "IN": "Hindiston",
+    "KR": "Janubiy Koreya", "JP": "Yaponiya", "CN": "Xitoy", "FR": "Fransiya", "DE": "Germaniya",
+    "IT": "Italiya", "ES": "Ispaniya", "CA": "Kanada", "AU": "Avstraliya", "UZ": "O‘zbekiston",
+    "KZ": "Qozog‘iston", "AE": "BAA", "QA": "Qatar", "EG": "Misr", "IR": "Eron", "HK": "Gonkong",
+    "MX": "Meksika", "BR": "Braziliya", "SE": "Shvetsiya", "PL": "Polsha", "UA": "Ukraina",
+}
+
+# ---- main.py dan beriladi (setup orqali) ----
+bot = None
+DB = None
+save_db = None
+BAZA_ID = None
+ADMIN_ID = None
+BOT_USERNAME = None
+
+queue: "asyncio.Queue" = asyncio.Queue()
+stats = {"ok": 0, "fail": 0, "dup": 0}
+_http = None
+_ai = None
+
+
+def setup(dp, bot_, db, save_db_, baza_id, admin_id, bot_username):
+    global bot, DB, save_db, BAZA_ID, ADMIN_ID, BOT_USERNAME
+    bot, DB, save_db, BAZA_ID, ADMIN_ID, BOT_USERNAME = bot_, db, save_db_, baza_id, admin_id, bot_username
+    if not RESERVE_ID:
+        print("auto_import: RESERVE_CHANNEL_ID berilmagan, modul o'chiq")
+        return
+
+    @dp.channel_post(F.chat.id == RESERVE_ID, F.video | F.document)
+    async def on_reserve_post(message: types.Message):
+        await queue.put(message)
+
+
+def start():
+    if RESERVE_ID:
+        asyncio.create_task(worker())
+
+
+# ------------------------------------------------------------------ tozalash
+JUNK = re.compile(
+    r"(@\w+|https?://\S+|t\.me/\S+|www\.\S+|\b(?:1080p|720p|480p|2160p|4k|hdrip|hd|webrip|web-dl|bluray|brrip|dvdrip|"
+    r"x264|x265|hevc|aac|mkv|mp4|avi|uzbek|o'zbek|ozbek|tarjima|uzbekcha|kino|film|skachat|yuklab)\b)",
+    re.I,
+)
+
+
+def regex_clean(raw: str) -> dict:
+    text = re.sub(r"\.(mkv|mp4|avi|mov)$", "", raw.strip(), flags=re.I)
+    text = text.replace(".", " ").replace("_", " ")
+    year_m = re.search(r"\b(19[3-9]\d|20[0-3]\d)\b", text)
+    year = int(year_m.group(1)) if year_m else None
+    if year_m:
+        text = text[: year_m.start()]
+    text = JUNK.sub(" ", text)
+    text = re.sub(r"[^\w\s:'’\-]", " ", text, flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return {"title": text, "search_title": text, "year": year}
+
+
+async def ai_parse(raw: str) -> dict:
+    """Claude yordamida nom va yilni ajratadi. Xato bo'lsa regex ga qaytadi."""
+    global _ai
+    base = regex_clean(raw)
+    if not (ANTHROPIC_KEY and AsyncAnthropic):
+        return base
+    try:
+        _ai = _ai or AsyncAnthropic(api_key=ANTHROPIC_KEY)
+        resp = await _ai.messages.create(
+            model=AI_MODEL,
+            max_tokens=200,
+            system=(
+                "Sen kino nomini aniqlovchi yordamchisan. Berilgan matn Telegram kanaldagi kino captioni yoki fayl nomi. "
+                "Undagi reklama, @username, havola, sifat (1080p), tarjima/studiya nomlari kabi ortiqcha narsalarni tashla. "
+                "Faqat JSON qaytar, boshqa hech narsa yozma: "
+                '{"title": "matndagi toza nom", "search_title": "kinoning asl (ingliz) nomi, TMDB da qidirish uchun", "year": 2009 yoki null}. '
+                "Agar nomni aniqlab bo'lmasa title ni bo'sh qoldir."
+            ),
+            messages=[{"role": "user", "content": raw[:800]}],
+        )
+        txt = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        txt = re.sub(r"```json|```", "", txt).strip()
+        data = json.loads(txt)
+        title = (data.get("title") or "").strip()
+        if not title:
+            return base
+        year = data.get("year")
+        return {
+            "title": title,
+            "search_title": (data.get("search_title") or title).strip(),
+            "year": int(year) if str(year).isdigit() else base["year"],
+        }
+    except Exception as e:
+        print("ai_parse xato:", e)
+        return base
+
+
+async def ai_short_uz(text: str, title: str) -> str:
+    """Tavsifni 1-2 gapli o'zbekcha (lotin) qisqa matnga aylantiradi."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if not (ANTHROPIC_KEY and AsyncAnthropic):
+        return text[:220]
+    try:
+        global _ai
+        _ai = _ai or AsyncAnthropic(api_key=ANTHROPIC_KEY)
+        resp = await _ai.messages.create(
+            model=AI_MODEL,
+            max_tokens=250,
+            system=(
+                "Kino tavsifini o'zbek tilida (lotin yozuvida) 1-2 gapga, 200 belgidan oshmasdan qisqartir. "
+                "Spoiler yozma. Faqat tayyor matnni qaytar."
+            ),
+            messages=[{"role": "user", "content": f"Kino: {title}\nTavsif: {text[:1200]}"}],
+        )
+        out = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+        return out[:260] or text[:220]
+    except Exception as e:
+        print("ai_short_uz xato:", e)
+        return text[:220]
+
+
+# ---------------------------------------------------------------------- TMDB
+async def tmdb(path: str, **params):
+    global _http
+    _http = _http or httpx.AsyncClient(timeout=20)
+    params["api_key"] = TMDB_KEY
+    r = await _http.get(f"https://api.themoviedb.org/3{path}", params=params)
+    r.raise_for_status()
+    return r.json()
+
+
+async def tmdb_find(parsed: dict) -> dict | None:
+    names = []
+    for n in (parsed["search_title"], parsed["title"]):
+        if n and n not in names:
+            names.append(n)
+    year = parsed.get("year")
+    for name in names:
+        for with_year in ([True, False] if year else [False]):
+            params = {"query": name, "language": "en-US", "include_adult": "false"}
+            if with_year:
+                params["year"] = year
+            res = (await tmdb("/search/movie", **params)).get("results", [])
+            if res:
+                best = res[0]
+                if year:
+                    for r in res:
+                        ry = (r.get("release_date") or "")[:4]
+                        if ry == str(year):
+                            best = r
+                            break
+                return best
+    return None
+
+
+async def tmdb_details(movie_id: int) -> dict:
+    d = await tmdb(f"/movie/{movie_id}", language="ru-RU")
+    if not d.get("overview"):
+        d_en = await tmdb(f"/movie/{movie_id}", language="en-US")
+        d["overview"] = d_en.get("overview", "")
+    return d
+
+
+# ------------------------------------------------------------------ yordamchi
+def next_code() -> str:
+    nums = [int(c) for c in DB["movies"] if str(c).isdigit()]
+    return str(max(nums) + 1 if nums else 1)
+
+
+def is_duplicate(uid: str) -> bool:
+    return any(m.get("uid") == uid for m in DB["movies"].values())
+
+
+async def tg_retry(coro_factory):
+    """Telegram 'flood wait' berganda kutib, qayta urinadi."""
+    for _ in range(4):
+        try:
+            return await coro_factory()
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+    return await coro_factory()
+
+
+async def notify_admin(text: str):
+    try:
+        await bot.send_message(ADMIN_ID, text, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+# -------------------------------------------------------------------- asosiy
+async def process(message: types.Message):
+    media = message.video or message.document
+    uid = media.file_unique_id
+    if is_duplicate(uid):
+        stats["dup"] += 1
+        return
+
+    raw = (message.caption or "").strip()
+    if not raw or len(re.sub(r"@\w+|https?://\S+|t\.me/\S+", "", raw).strip()) < 2:
+        raw = getattr(media, "file_name", "") or raw
+    parsed = await ai_parse(raw)
+    if not parsed["title"]:
+        stats["fail"] += 1
+        await notify_admin(f"⚠️ Nomini aniqlab bo‘lmadi (zaxira kanal, xabar #{message.message_id}).\nMatn: <code>{html.escape(raw[:200])}</code>")
+        return
+
+    found = await tmdb_find(parsed) if TMDB_KEY else None
+    if not found:
+        stats["fail"] += 1
+        await notify_admin(
+            f"⚠️ TMDB da topilmadi: <b>{html.escape(parsed['title'])}</b> ({parsed.get('year') or '?'})\n"
+            f"Zaxira kanal xabar #{message.message_id}. Qo‘lda joylang (/panel)."
+        )
+        return
+
+    d = await tmdb_details(found["id"])
+    title = parsed["title"]
+    year = (d.get("release_date") or "")[:4] or str(parsed.get("year") or "")
+    genre = ", ".join(GENRES_UZ.get(g["id"], g["name"]) for g in d.get("genres", [])[:3]) or "Drama"
+    countries = [COUNTRIES_UZ.get(c["iso_3166_1"], c["name"]) for c in d.get("production_countries", [])[:2]]
+    country = ", ".join(countries) or "AQSH"
+    rating = round(d.get("vote_average") or 0, 1)
+    poster = f"https://image.tmdb.org/t/p/w500{d['poster_path']}" if d.get("poster_path") else ""
+    desc = await ai_short_uz(d.get("overview", ""), title)
+
+    clean_caption = f"🎬 {title} ({year})" if year else f"🎬 {title}"
+
+    # 1) botning baza kanaliga nusxa (toza caption bilan)
+    sent = await tg_retry(lambda: bot.copy_message(BAZA_ID, message.chat.id, message.message_id, caption=clean_caption))
+
+    # 2) bot bazasiga yozish (mini app shu bazadan oladi)
+    code = next_code()
+    DB["movies"][code] = {
+        "episodes": [sent.message_id], "title": title, "year": year, "genre": genre, "country": country,
+        "poster": poster or DEFAULT_POSTER, "type": "cartoon" if 16 in [g["id"] for g in d.get("genres", [])] else "movie",
+        "premium": False, "views": 0, "ep_views": {"1": 0}, "votes": [], "created_at": int(time.time()),
+        "uid": uid, "tmdb_id": found["id"], "tmdb_rating": rating,
+    }
+    await save_db()
+
+    # 3) zaxira kanaldagi reklama yozuvlarini tozalash
+    try:
+        await tg_retry(lambda: bot.edit_message_caption(chat_id=message.chat.id, message_id=message.message_id, caption=clean_caption))
+    except Exception as e:
+        print("zaxira caption tozalanmadi:", e)
+
+    # 4) reklama kanalga post
+    if AD_CHANNEL:
+        ad_text = (
+            f"🎬 <b>{html.escape(title)}</b> ({year})\n\n"
+            f"🎭 Janr: {html.escape(genre)}\n🌍 Davlat: {html.escape(country)}\n"
+            f"⭐ Reyting: {rating}/10\n\n"
+            + (f"📝 {html.escape(desc)}\n\n" if desc else "")
+            + f"🔢 Kod: <code>{code}</code>"
+        )[:1000]
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🎬 Ko‘rish", url=f"https://t.me/{BOT_USERNAME}?start=kino_{code}")
+        ]])
+        try:
+            if poster:
+                await tg_retry(lambda: bot.send_photo(AD_CHANNEL, poster, caption=ad_text, parse_mode="HTML", reply_markup=kb))
+            else:
+                await tg_retry(lambda: bot.send_message(AD_CHANNEL, ad_text, parse_mode="HTML", reply_markup=kb))
+        except Exception as e:
+            await notify_admin(f"⚠️ Reklama kanalga post chiqmadi ({html.escape(title)}): {html.escape(str(e))}")
+
+    stats["ok"] += 1
+
+
+async def worker():
+    while True:
+        message = await queue.get()
+        try:
+            await process(message)
+        except Exception as e:
+            stats["fail"] += 1
+            print("auto_import xato:", e)
+            await notify_admin(f"⚠️ Import xatosi (xabar #{message.message_id}): {html.escape(str(e)[:200])}")
+        queue.task_done()
+        if queue.empty():
+            await notify_admin(
+                f"✅ Navbat tugadi.\nQo‘shildi: <b>{stats['ok']}</b>\nTopilmadi/xato: <b>{stats['fail']}</b>\nTakror: <b>{stats['dup']}</b>"
+            )
+            stats.update(ok=0, fail=0, dup=0)
+        await asyncio.sleep(DELAY)
+import os
+import io
 import json
 import time
 import asyncio
 from datetime import datetime
 from contextlib import asynccontextmanager
-import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
+from aiogram.exceptions import TelegramBadRequest
+import auto_import
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
@@ -21,40 +357,27 @@ from aiogram.types import (
     WebAppInfo,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    BufferedInputFile,
+    InputMediaDocument,
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 ADMIN_ID = 6248171499
 BAZA_CHANNEL_ID = -1003958730565
-BACKUP_CHANNEL_ID = -1005905529010
-PUBLIC_CHANNEL = "@filmora_kinolar"
 MINI_APP_URL = "https://abzalbeksomidov.github.io/Filmora-app/"
 BOT_USERNAME = "Filmorabot_bot"
-AUTO_INTERVAL = 17280  # Har 4.8 soatda (kuniga 5 ta kino)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 DB = {
     "movies": {},
-    "queue": [],
-    "next_auto_code": 1001,
     "channels": [{"id": "@filmora_kinolar", "title": "Filmora Kinolar", "url": "https://t.me/filmora_kinolar", "active": True}],
     "premium_users": {},
     "users": {},
-    "settings": {
-        "card": "Karta kiritilmagan (/panel)",
-        "price": "15 000 so‘m (1 oy)",
-        "sub_enabled": True,
-        "auto_publish": True,
-        "last_auto_time": 0,
-    },
+    "settings": {"card": "Karta kiritilmagan (/panel)", "price": "15 000 so‘m (1 oy)", "sub_enabled": True},
 }
 DB_MSG_ID = None
-PENDING_NAME_PROMPTS = {}
 
 
 def ensure_user(uid: int, name: str = "Foydalanuvchi"):
@@ -66,361 +389,64 @@ def ensure_user(uid: int, name: str = "Foydalanuvchi"):
     return DB["users"][suid]
 
 
+_save_lock = asyncio.Lock()
+
+
 async def load_db():
-    global DB, DB_MSG_ID
-    try:
-        chat = await bot.get_chat(BAZA_CHANNEL_ID)
-        if chat.pinned_message and chat.pinned_message.text and chat.pinned_message.text.startswith("FILMORA_DB:"):
-            loaded = json.loads(chat.pinned_message.text.replace("FILMORA_DB:", "", 1).strip())
-            if isinstance(loaded.get("users"), list):
-                loaded["users"] = {str(u): {"name": "Foydalanuvchi", "favs": [], "subs": [], "history": [], "progress": {}, "refs": [], "referred_by": None} for u in loaded["users"]}
-            if "queue" not in loaded:
-                loaded["queue"] = []
-            if "next_auto_code" not in loaded:
-                nums = [int(k) for k in loaded.get("movies", {}).keys() if str(k).isdigit()]
-                loaded["next_auto_code"] = max(nums + [1000]) + 1
-            loaded.setdefault("settings", {})
-            loaded["settings"].setdefault("auto_publish", True)
-            loaded["settings"].setdefault("last_auto_time", 0)
-            DB.update(loaded)
-            DB_MSG_ID = chat.pinned_message.message_id
+    """Baza endi pin qilingan filmora_db.json FAYLDA saqlanadi (matn xabar 4096 belgidan oshib ketardi)."""
+    global DB_MSG_ID
+    last_err = None
+    for _ in range(3):
+        try:
+            chat = await bot.get_chat(BAZA_CHANNEL_ID)
+            pm = chat.pinned_message
+            loaded = None
+            if pm and pm.document and pm.document.file_name == "filmora_db.json":
+                buf = io.BytesIO()
+                await bot.download(pm.document.file_id, destination=buf)
+                loaded = json.loads(buf.getvalue().decode("utf-8"))
+                DB_MSG_ID = pm.message_id
+            elif pm and pm.text and pm.text.startswith("FILMORA_DB:"):
+                loaded = json.loads(pm.text.replace("FILMORA_DB:", "", 1).strip())
+                DB_MSG_ID = None  # eski matnli baza: keyingi saqlashda faylga ko'chadi
+            if loaded is not None:
+                if isinstance(loaded.get("users"), list):
+                    loaded["users"] = {str(u): {"name": "Foydalanuvchi", "favs": [], "subs": [], "history": [], "progress": {}, "refs": [], "referred_by": None} for u in loaded["users"]}
+                DB.update(loaded)
+                if DB_MSG_ID is None:
+                    await save_db()
+                return
+            await save_db()  # baza umuman yo'q: birinchi marta yaratamiz
             return
-    except Exception as e:
-        print("DB load error:", e)
-    await save_db()
+        except Exception as e:
+            last_err = e
+            print("DB load error:", e)
+            await asyncio.sleep(2)
+    # bazani o'qib bo'lmadi: bo'sh baza bilan ustidan yozib yubormaslik uchun ishga tushmaymiz
+    raise RuntimeError(f"DB o'qilmadi: {last_err}")
 
 
 async def save_db():
     global DB_MSG_ID
-    payload = "FILMORA_DB:\n" + json.dumps(DB, ensure_ascii=False)
-    try:
-        if DB_MSG_ID:
-            await bot.edit_message_text(chat_id=BAZA_CHANNEL_ID, message_id=DB_MSG_ID, text=payload)
-        else:
-            msg = await bot.send_message(chat_id=BAZA_CHANNEL_ID, text=payload)
+    data = json.dumps(DB, ensure_ascii=False).encode("utf-8")
+    async with _save_lock:
+        doc = BufferedInputFile(data, filename="filmora_db.json")
+        try:
+            if DB_MSG_ID:
+                try:
+                    await bot.edit_message_media(chat_id=BAZA_CHANNEL_ID, message_id=DB_MSG_ID, media=InputMediaDocument(media=doc))
+                    return
+                except TelegramBadRequest as e:
+                    if "not modified" in str(e):
+                        return
+                    print("DB edit error:", e)
+            msg = await bot.send_document(BAZA_CHANNEL_ID, doc, disable_notification=True)
             DB_MSG_ID = msg.message_id
             await bot.pin_chat_message(chat_id=BAZA_CHANNEL_ID, message_id=DB_MSG_ID, disable_notification=True)
-    except Exception as e:
-        print("DB save error:", e)
-
-
-# ================= ZAXIRA KANAL, GEMINI VA AVTO-REKLAMA =================
-def extract_caption_details(raw_text: str) -> dict:
-    info = {"title": "", "year": "", "genre": "", "country": ""}
-    if not raw_text:
-        return info
-    q_match = re.search(r'["«“]([^"»”\n]{2,80})["»”]', raw_text)
-    if q_match:
-        info["title"] = q_match.group(1).strip()
-    y_match = re.search(r'(?:Yili|Year|Год)\s*[:\-]?\s*(19\d{2}|20\d{2})', raw_text, re.I)
-    if not y_match:
-        y_match = re.search(r'\b(19[5-9]\d|20[0-2]\d)\b', raw_text)
-    if y_match:
-        info["year"] = y_match.group(1)
-    g_match = re.search(r'(?:Janr|Genre|Жанр)\s*[:\-]?\s*([^\n]+)', raw_text, re.I)
-    if g_match:
-        info["genre"] = g_match.group(1).strip()
-    c_match = re.search(r'(?:Davlat|Country|Страна|Mamlakat)\s*[:\-]?\s*([^\n]+)', raw_text, re.I)
-    if c_match:
-        info["country"] = c_match.group(1).strip()
-    if not info["title"]:
-        lines = []
-        for line in raw_text.splitlines():
-            clean_l = re.sub(r'@\w+|https?://\S+|t\.me/\S+', '', line).strip()
-            if not clean_l or re.match(r'^(PREMYERA|Yili|Janr|Davlat|KinoPoisk|IMDb|O\'zbek|Til|Sifat|Kanal|Obuna)', clean_l, re.I):
-                continue
-            lines.append(clean_l)
-        if lines:
-            info["title"] = re.sub(r'[^\w\s\'\-\:\(\)]', '', lines[0]).strip()
-    return info
-
-
-def is_junk_filename(fname: str) -> bool:
-    if not fname:
-        return True
-    base = os.path.splitext(fname)[0].strip()
-    if len(base) <= 4:
-        return True
-    return bool(re.match(r'^(VID|MOV|IMG|VIDEO|FILE|DOC|MP4|HD|FULL|NEW|KINO|FILM)[\s_\-\d]*$', base, re.I))
-
-def clean_movie_query(text: str) -> str:
-    if not text:
-        return ""
-    s = re.sub(r"^(?:🎬|🎥|🎞)?\s*(?:film\s*nomi|kino\s*nomi|nomi)\s*[:\-–]\s*", "", text, flags=re.I)
-    s = re.sub(r"\(\s*\d{4}\s*\)", "", s)
-    s = re.sub(r"[\"'«»“”]", "", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-async def fetch_itunes_poster(search_query: str) -> str:
-    q = clean_movie_query(search_query)
-    if not q:
-        return ""
-    try:
-        async with httpx.AsyncClient(timeout=12) as client:
-            r = await client.get(
-                "https://itunes.apple.com/search",
-                params={"term": q, "media": "movie", "limit": 5},
-            )
-            results = r.json().get("results", [])
-            if results and results[0].get("artworkUrl100"):
-                return results[0]["artworkUrl100"].replace("100x100bb", "600x900bb")
-    except Exception as e:
-        print("iTunes error:", e)
-    return ""
-
-
-async def fetch_tmdb_poster(title: str, year: str = "") -> str:
-    q = clean_movie_query(title)
-    if not TMDB_API_KEY or not q:
-        return ""
-    try:
-        async with httpx.AsyncClient(timeout=12) as client:
-            for lang in ("en-US", "ru-RU"):
-                params = {"api_key": TMDB_API_KEY, "query": q, "language": lang}
-                if year and year.isdigit():
-                    params["year"] = year
-                r = await client.get("https://api.themoviedb.org/3/search/movie", params=params)
-                data = r.json()
-                for item in data.get("results", []):
-                    if item.get("poster_path"):
-                        return f"https://image.tmdb.org/t/p/w500{item['poster_path']}"
-                if "year" in params:
-                    del params["year"]
-                    r2 = await client.get("https://api.themoviedb.org/3/search/movie", params=params)
-                    for item in r2.json().get("results", []):
-                        if item.get("poster_path"):
-                            return f"https://image.tmdb.org/t/p/w500{item['poster_path']}"
-    except Exception as e:
-        print("TMDB error:", e)
-    return ""
-
-
-async def fetch_wiki_poster(query: str) -> str:
-    q = clean_movie_query(query)
-    if not q:
-        return ""
-    headers = {"User-Agent": "FilmoraBot/1.0 (https://t.me/filmora_kinolar; contact@filmora.uz)"}
-    try:
-        async with httpx.AsyncClient(timeout=12, headers=headers) as client:
-            r = await client.get(
-                "https://en.wikipedia.org/w/api.php",
-                params={
-                    "action": "query",
-                    "generator": "search",
-                    "gsrsearch": f"{q} film",
-                    "gsrlimit": 3,
-                    "prop": "pageimages",
-                    "piprop": "thumbnail",
-                    "pithumbsize": 600,
-                    "format": "json",
-                },
-            )
-            if r.status_code == 200 and r.text.strip().startswith("{"):
-                pages = r.json().get("query", {}).get("pages", {})
-                for p in pages.values():
-                    thumb = p.get("thumbnail", {}).get("source")
-                    if thumb and thumb.startswith("http"):
-                        return thumb
-    except Exception as e:
-        print("Wiki error:", e)
-    return ""
-
-
-async def fallback_translate_title(text: str, target_lang: str) -> str:
-    if not text:
-        return ""
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(
-                "https://translate.googleapis.com/translate_a/single",
-                params={"client": "gtx", "sl": "uz", "tl": target_lang, "dt": "t", "q": text},
-            )
-            if r.status_code == 200:
-                data = r.json()
-                translated = "".join(part[0] for part in data[0] if part and part[0])
-                return clean_movie_query(translated)
-    except Exception as e:
-        print(f"Translate ({target_lang}) error:", e)
-    return ""
-
-
-async def identify_movie_with_gemini(raw_hint: str, parsed: dict) -> dict:
-    title_uz = clean_movie_query(parsed.get("title") or raw_hint) or "Kino"
-    year = parsed.get("year") or "2024"
-    genre = parsed.get("genre") or "Jangari, Drama"
-    country = parsed.get("country") or "AQSH"
-    desc = (
-        f"{title_uz} ({year}) filmi keskin burilishlar va unutilmas sahnalari bilan "
-        f"tomoshabinni ilk daqiqalardanoq o‘ziga tortadi. To‘liq versiyani botimiz orqali hoziroq ko‘ring!"
-    )
-    english_query = ""
-    russian_query = ""
-    ai_success = False
-
-    prompt = (
-        f"Quyidagi ma'lumot asosida filmni aniqla:\n"
-        f"Matn: {raw_hint}\nAjratilgan nom: {title_uz}, Yil: {year}, Davlat: {country}, Janr: {genre}\n\n"
-        f"Faqat quyidagi JSON formatda javob ber (boshqa hech narsa yozma):\n"
-        f'{{"title_uz": "O\'zbekcha aniq nomi", "english_title": "Exact original or English movie title", '
-        f'"russian_title": "Точное русское название фильма", '
-        f'"year": "4 xonali yil", "genre": "Janri o\'zbekcha", "country": "Davlati o\'zbekcha", '
-        f'"desc": "Kino haqida o\'zbek tilida 2 gaplik qiziqarli reklama tavsifi"}}'
-    )
-
-    # 1. GROQ (Asosiy va eng tezkor AI)
-    if GROQ_API_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                resp = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {GROQ_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": "llama-3.3-70b-versatile",
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.2,
-                    },
-                )
-                data = resp.json()
-                if "choices" in data and data["choices"]:
-                    text_out = data["choices"][0]["message"]["content"]
-                    m = re.search(r"\{.*\}", text_out, re.S)
-                    if m:
-                        ai_data = json.loads(m.group(0))
-                        title_uz = clean_movie_query(ai_data.get("title_uz")) or title_uz
-                        english_query = clean_movie_query(ai_data.get("english_title"))
-                        russian_query = clean_movie_query(ai_data.get("russian_title"))
-                        year = str(ai_data.get("year") or year)
-                        genre = ai_data.get("genre") or genre
-                        country = ai_data.get("country") or country
-                        desc = ai_data.get("desc") or desc
-                        ai_success = True
-                        print("Groq AI success!")
-                else:
-                    print("Groq error:", data)
         except Exception as e:
-            print("Groq exception:", e)
-
-    # 2. GEMINI (Zaxira AI)
-    if not ai_success and GEMINI_API_KEY:
-        for model_name in ("gemini-3.8-flash", "gemini-2.0-flash"):
-            url = (
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{model_name}:generateContent?key={GEMINI_API_KEY}"
-            )
-            try:
-                async with httpx.AsyncClient(timeout=20) as client:
-                    resp = await client.post(url, json={"contents": [{"parts": [{"text": prompt}]}]})
-                    data = resp.json()
-                    if "candidates" in data and data["candidates"]:
-                        text_out = data["candidates"][0]["content"]["parts"][0]["text"]
-                        m = re.search(r"\{.*\}", text_out, re.S)
-                        if m:
-                            ai_data = json.loads(m.group(0))
-                            title_uz = clean_movie_query(ai_data.get("title_uz")) or title_uz
-                            english_query = clean_movie_query(ai_data.get("english_title"))
-                            russian_query = clean_movie_query(ai_data.get("russian_title"))
-                            year = str(ai_data.get("year") or year)
-                            genre = ai_data.get("genre") or genre
-                            country = ai_data.get("country") or country
-                            desc = ai_data.get("desc") or desc
-                            ai_success = True
-                            break
-            except Exception as e:
-                print(f"Gemini ({model_name}) exception:", e)
-
-    # 3. TARJIMON ZAXIRASI
-    if not ai_success or not english_query:
-        english_query = await fallback_translate_title(title_uz, "en") or title_uz
-    if not russian_query:
-        russian_query = await fallback_translate_title(title_uz, "ru")
-
-    print(f"Poster search -> title_uz={title_uz!r}, en={english_query!r}, ru={russian_query!r}, year={year!r}")
-    poster = (
-        await fetch_tmdb_poster(english_query, year)
-        or await fetch_tmdb_poster(russian_query, year)
-        or await fetch_tmdb_poster(title_uz, year)
-        or await fetch_itunes_poster(f"{english_query} {year}")
-        or await fetch_itunes_poster(english_query)
-        or await fetch_wiki_poster(f"{english_query} {year}")
-        or await fetch_itunes_poster(title_uz)
-    )
-    if not poster:
-        print("Poster fallback used!")
-        poster = "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500&q=80"
-
-    return {
-        "title": title_uz,
-        "year": year,
-        "genre": genre,
-        "country": country,
-        "desc": desc,
-        "poster": poster,
-    }
-    
-            
+            print("DB save error:", e)
 
 
-async def publish_next_queued_movie() -> tuple[bool, str]:
-    if not DB.get("queue"):
-        return False, "Navbatda kino yo‘q."
-
-    item = DB["queue"].pop(0)
-    while str(DB.get("next_auto_code", 1001)) in DB["movies"]:
-        DB["next_auto_code"] = int(DB.get("next_auto_code", 1001)) + 1
-    code = str(DB["next_auto_code"])
-    DB["next_auto_code"] = int(code) + 1
-
-    try:
-        copied = await bot.copy_message(
-            chat_id=BAZA_CHANNEL_ID,
-            from_chat_id=BACKUP_CHANNEL_ID,
-            message_id=item["backup_msg_id"],
-            caption=f"🎬 <b>{item['title']} ({item['year']})</b>\n🔢 Kod: <code>{code}</code>",
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        DB["queue"].insert(0, item)
-        return False, f"Zaxira kanaldan nusxalashda xato: {e}"
-
-    DB["movies"][code] = {
-        "episodes": [copied.message_id],
-        "title": item["title"],
-        "year": item["year"],
-        "genre": item["genre"],
-        "country": item["country"],
-        "poster": item["poster"],
-        "type": "movie",
-        "premium": False,
-        "views": 0,
-        "ep_views": {"1": 0},
-        "votes": [],
-        "created_at": int(time.time()),
-    }
-    DB["settings"]["last_auto_time"] = int(time.time())
-    await save_db()
-
-    ad_caption = (
-        f"🔥 <b>PREMYERA | {item['title'].upper()} ({item['year']})</b>\n\n"
-        f"🎭 <b>Janr:</b> {item['genre']}\n"
-        f"🌍 <b>Davlat:</b> {item['country']}\n"
-        f"🇺🇿 <b>Til:</b> O‘zbek tilida (HD)\n\n"
-        f"📖 <i>{item['desc']}</i>\n\n"
-        f"🔢 <b>Kino kodi:</b> <code>{code}</code>\n"
-        f"🤖 <b>Bot orqali ko‘rish:</b> @{BOT_USERNAME}"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="▶️ Kinoni tomosha qilish", url=f"https://t.me/{BOT_USERNAME}?start={code}")
-    ]])
-    try:
-        await bot.send_photo(chat_id=PUBLIC_CHANNEL, photo=item["poster"], caption=ad_caption, parse_mode="HTML", reply_markup=kb)
-    except Exception as e:
-        return True, f"✅ Bazaga saqlandi (Kod: <code>{code}</code>), lekin kanalga post chiqishida xato: {e}"
-
-    return True, f"✅ <b>{item['title']}</b> (Kod: <code>{code}</code>) baza va {PUBLIC_CHANNEL} kanaliga chiqarildi!"
 def is_premium(user_id: int) -> bool:
     return user_id == ADMIN_ID or DB["premium_users"].get(str(user_id), 0) > int(time.time())
 
@@ -509,7 +535,6 @@ async def send_content_to_user(user_id: int, code: str, ep_idx: int = 1):
     )
     await bot.copy_message(user_id, BAZA_CHANNEL_ID, episodes[ep_idx - 1], caption=caption, parse_mode="HTML", reply_markup=movie_inline_kb(code, m, ep_idx))
 
-
 class AdminStates(StatesGroup):
     add_kind = State()
     add_code = State()
@@ -538,12 +563,8 @@ class AdminStates(StatesGroup):
 
 def admin_panel_kb():
     sub_state = "🟢 Yoqilgan" if DB["settings"].get("sub_enabled", True) else "🔴 O‘chirilgan"
-    auto_state = "🟢 Yoqilgan" if DB["settings"].get("auto_publish", True) else "🔴 O‘chirilgan"
-    q_len = len(DB.get("queue", []))
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=f"🤖 Avto-navbat ({q_len} ta)", callback_data="adm_queue"), InlineKeyboardButton(text="▶️ Hoziroq chiqarish", callback_data="adm_pub_now")],
-            [InlineKeyboardButton(text=f"⏱ Avto-taymer: {auto_state}", callback_data="adm_toggle_auto")],
             [InlineKeyboardButton(text="🎬 Kino / Multfilm joylash", callback_data="add_kind:movie")],
             [InlineKeyboardButton(text="📺 Serial joylash (1-qism)", callback_data="add_kind:series"), InlineKeyboardButton(text="➕ Qism joylash", callback_data="adm_add_ep")],
             [InlineKeyboardButton(text="✏️ Tahrirlash", callback_data="adm_edit_movie"), InlineKeyboardButton(text="🗑 O‘chirish", callback_data="adm_del_movie")],
@@ -556,73 +577,6 @@ def admin_panel_kb():
     )
 
 
-async def process_backup_movie_bg(backup_msg_id: int, hint: str, parsed: dict):
-    info = await identify_movie_with_gemini(hint, parsed)
-    DB.setdefault("queue", []).append({
-        "backup_msg_id": backup_msg_id,
-        "title": info["title"],
-        "year": info["year"],
-        "genre": info["genre"],
-        "country": info["country"],
-        "desc": info["desc"],
-        "poster": info["poster"],
-    })
-    await save_db()
-    try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"📥 <b>Avto-navbatga qo‘shildi!</b>\n\n"
-            f"🎬 <b>Nomi:</b> {info['title']} ({info['year']})\n"
-            f"🎭 <b>Janr:</b> {info['genre']}\n"
-            f"🖼 <b>Poster:</b> {'✅ Asl poster topildi' if 'unsplash.com' not in info['poster'] else '⚠️ Standart rasm'}\n"
-            f"⏳ <b>Navbatda jami:</b> {len(DB['queue'])} ta",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="▶️ Hoziroq kanalga chiqarish", callback_data="adm_pub_now")
-            ]]),
-        )
-    except Exception:
-        pass
-
-
-@dp.channel_post(F.chat.id == BACKUP_CHANNEL_ID)
-async def backup_channel_watcher(message: types.Message):
-    media = message.video or message.document
-    if not media:
-        return
-    raw_caption = message.caption or ""
-    fname = getattr(media, "file_name", "") or ""
-    parsed = extract_caption_details(raw_caption)
-
-    if not parsed["title"] and is_junk_filename(fname):
-        try:
-            ask = await bot.send_message(
-                ADMIN_ID,
-                f"⚠️ <b>Zaxira kanalga nomsiz/shifrli kino tushdi!</b>\n"
-                f"📁 Fayl: <code>{fname or 'Nomsiz'}</code>\n\n"
-                f"Aniq poster va reklama posti yaratish uchun <b>shu xabarga Reply qilib kino nomini yozing</b> (masalan: <i>Daxshatli qo'rquv 2018</i>):",
-                parse_mode="HTML",
-            )
-            PENDING_NAME_PROMPTS[ask.message_id] = message.message_id
-        except Exception:
-            pass
-        return
-
-    hint = raw_caption if raw_caption else os.path.splitext(fname)[0]
-    try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"⏳ <b>Yangi kino qabul qilindi!</b>\n"
-            f"3 daqiqagacha vaqt ichida asl poster va tavsif tayyorlanib navbatga qo‘shiladi...",
-            parse_mode="HTML",
-        )
-    except Exception:
-        pass
-    asyncio.create_task(process_backup_movie_bg(message.message_id, hint, parsed))
-        
-    
-
-
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
@@ -630,10 +584,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
     is_new = str(uid) not in DB["users"]
     u = ensure_user(uid, message.from_user.full_name)
     parts = message.text.split()
-    arg = parts[1].strip() if len(parts) > 1 else ""
-
-    if is_new and arg.startswith("ref_"):
-        ref_id = arg.replace("ref_", "")
+    if is_new and len(parts) > 1 and parts[1].startswith("ref_"):
+        ref_id = parts[1].replace("ref_", "")
         if ref_id != str(uid) and ref_id in DB["users"]:
             u["referred_by"] = ref_id
             if uid not in DB["users"][ref_id]["refs"]:
@@ -649,15 +601,13 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if missing:
         await message.answer("🎬 Kinolarni ko‘rish uchun avval kanallarga obuna bo‘ling:", reply_markup=sub_keyboard(missing))
         return
-
-    if arg and arg in DB["movies"]:
-        movie = DB["movies"][arg]
-        if movie.get("premium") and not is_premium(uid):
-            await premium_info(message, None)
+    if len(parts) > 1 and parts[1].startswith("kino_"):
+        code = parts[1][5:]
+        m = DB["movies"].get(code)
+        if m and (not m.get("premium") or is_premium(uid)):
+            await message.answer("🍿 Marhamat!", reply_markup=main_reply_keyboard(uid))
+            await send_content_to_user(uid, code, 1)
             return
-        await send_content_to_user(uid, arg, 1)
-        return
-
     await message.answer("👋 Xush kelibsiz! <b>FILMORA | PRO</b> katalogini oching yoki kino kodini yuboring:", parse_mode="HTML", reply_markup=main_reply_keyboard(uid))
 
 
@@ -668,14 +618,13 @@ async def check_sub_cb(call: types.CallbackQuery):
         await call.message.answer("✅ Obuna tasdiqlandi!", reply_markup=main_reply_keyboard(call.from_user.id))
     else:
         await call.answer("❌ Hali barcha kanallarga obuna bo‘lmagansiz!", show_alert=True)
-
-
 @dp.message(F.text == "🎬 FILMORA PRO (Katalog)")
 async def open_catalog_btn(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🎬 FILMORA PRO Katalogini ochish", web_app=WebAppInfo(url=MINI_APP_URL))
     ]])
     await message.answer("🍿 <b>FILMORA | PRO</b> katalogiga kirish uchun quyidagi tugmani bosing:", parse_mode="HTML", reply_markup=kb)
+
 
 
 @dp.message(F.text == "🔎 Kino kodi")
@@ -817,75 +766,6 @@ async def open_admin_panel(message: types.Message, state: FSMContext):
         return
     await state.clear()
     await message.answer("⚙️ <b>FILMORA PRO — Admin Panel</b>", parse_mode="HTML", reply_markup=admin_panel_kb())
-
-
-@dp.callback_query(F.data == "adm_queue")
-async def adm_queue_cb(call: types.CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
-    q = DB.get("queue", [])
-    if not q:
-        await call.answer("Avto-navbat bo‘sh!", show_alert=True)
-        return
-    lines = [f"{i+1}. <b>{x['title']}</b> ({x['year']})" for i, x in enumerate(q[:15])]
-    await call.message.answer("⏳ <b>Avto-navbatdagi kinolar:</b>\n\n" + "\n".join(lines), parse_mode="HTML")
-    await call.answer()
-
-
-async def publish_next_bg(chat_id: int):
-    if DB.get("queue"):
-        first = DB["queue"][0]
-        if not first.get("poster") or "unsplash.com" in first.get("poster", ""):
-            refreshed = await identify_movie_with_gemini(
-                f"{first.get('title', '')} {first.get('year', '')}",
-                {
-                    "title": first.get("title", ""),
-                    "year": first.get("year", ""),
-                    "genre": first.get("genre", ""),
-                    "country": first.get("country", ""),
-                },
-            )
-            first.update({
-                "title": refreshed["title"],
-                "year": refreshed["year"],
-                "genre": refreshed["genre"],
-                "country": refreshed["country"],
-                "desc": refreshed["desc"],
-                "poster": refreshed["poster"],
-            })
-            await save_db()
-
-    ok, msg = await publish_next_queued_movie()
-    try:
-        await bot.send_message(chat_id, msg, parse_mode="HTML")
-    except Exception:
-        pass
-
-
-@dp.callback_query(F.data == "adm_pub_now")
-async def adm_pub_now_cb(call: types.CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
-    if not DB.get("queue"):
-        await call.answer("Navbatda kino yo‘q!", show_alert=True)
-        return
-    await call.answer("⏳ 3 daqiqagacha tayyorlanib kanalga joylanadi!", show_alert=True)
-    await call.message.answer(
-        "⏳ <b>Kino tahlil qilinmoqda...</b>\n3 daqiqa ichida tayyor bo‘lib kanalga joylanadi!",
-        parse_mode="HTML",
-    )
-    asyncio.create_task(publish_next_bg(call.message.chat.id))
-                
-
-
-@dp.callback_query(F.data == "adm_toggle_auto")
-async def adm_toggle_auto_cb(call: types.CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
-    DB["settings"]["auto_publish"] = not DB["settings"].get("auto_publish", True)
-    await save_db()
-    await call.message.edit_reply_markup(reply_markup=admin_panel_kb())
-    await call.answer("Avto-taymer holati o‘zgardi!")
 
 
 @dp.callback_query(F.data.startswith("add_kind:"))
@@ -1195,7 +1075,7 @@ async def adm_give_prem_done(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "adm_stats")
 async def adm_stats(call: types.CallbackQuery):
     active_prem = sum(1 for exp in DB["premium_users"].values() if exp > int(time.time()))
-    await call.message.answer(f"📊 Foydalanuvchilar: <b>{len(DB['users'])}</b>\n💎 VIP: <b>{active_prem}</b>\n🎬 Jami kontent: <b>{len(DB['movies'])}</b>\n⏳ Avto-navbat: <b>{len(DB.get('queue', []))}</b>", parse_mode="HTML")
+    await call.message.answer(f"📊 Foydalanuvchilar: <b>{len(DB['users'])}</b>\n💎 VIP: <b>{active_prem}</b>\n🎬 Jami kontent: <b>{len(DB['movies'])}</b>", parse_mode="HTML")
     await call.answer()
 
 
@@ -1222,33 +1102,6 @@ async def adm_broadcast_send(message: types.Message, state: FSMContext):
 @dp.message(F.text)
 async def send_movie_by_code(message: types.Message):
     uid = message.from_user.id
-    if (
-        uid == ADMIN_ID
-        and message.reply_to_message
-        and message.reply_to_message.message_id in PENDING_NAME_PROMPTS
-    ):
-        backup_msg_id = PENDING_NAME_PROMPTS.pop(message.reply_to_message.message_id)
-        parsed = extract_caption_details(message.text)
-        info = await identify_movie_with_gemini(message.text, parsed)
-        DB.setdefault("queue", []).append({
-            "backup_msg_id": backup_msg_id,
-            "title": info["title"],
-            "year": info["year"],
-            "genre": info["genre"],
-            "country": info["country"],
-            "desc": info["desc"],
-            "poster": info["poster"],
-        })
-        await save_db()
-        await message.reply(
-            f"✅ <b>{info['title']} ({info['year']})</b> aniqlanib avto-navbatga qo‘shildi!",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="▶️ Hoziroq kanalga chiqarish", callback_data="adm_pub_now")
-            ]]),
-        )
-        return
-
     missing = await get_unsubscribed_channels(uid)
     if missing:
         await message.answer("🎬 Kinolarni ko‘rish uchun avval kanallarga obuna bo‘ling:", reply_markup=sub_keyboard(missing))
@@ -1268,6 +1121,9 @@ async def send_movie_by_code(message: types.Message):
         await message.answer("⚠️ Yuborishda xatolik.")
 
 
+auto_import.setup(dp, bot, DB, save_db, BAZA_CHANNEL_ID, ADMIN_ID, BOT_USERNAME)
+
+
 class WatchRequest(BaseModel):
     user_id: int
     code: str
@@ -1280,29 +1136,14 @@ class ActionRequest(BaseModel):
     score: int = 0
 
 
-async def auto_publisher_loop():
-    while True:
-        await asyncio.sleep(60)
-        try:
-            if DB["settings"].get("auto_publish", True) and DB.get("queue"):
-                last_t = DB["settings"].get("last_auto_time", 0)
-                if time.time() - last_t >= AUTO_INTERVAL:
-                    ok, msg = await publish_next_queued_movie()
-                    if ok:
-                        await bot.send_message(ADMIN_ID, f"🤖 <b>Avto-reklama chiqarildi:</b>\n{msg}", parse_mode="HTML")
-        except Exception as e:
-            print("Auto publisher error:", e)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await load_db()
+    auto_import.start()
     await bot.delete_webhook(drop_pending_updates=True)
     task = asyncio.create_task(dp.start_polling(bot))
-    auto_task = asyncio.create_task(auto_publisher_loop())
     yield
     task.cancel()
-    auto_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -1396,4 +1237,5 @@ async def api_watch(req: WatchRequest):
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-        
+
+    

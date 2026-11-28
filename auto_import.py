@@ -12,7 +12,8 @@ Kerakli environment o'zgaruvchilar (Render -> Environment):
   RESERVE_CHANNEL_ID   zaxira kanal ID si (masalan -1001234567890)
   AD_CHANNEL_ID        reklama kanal ID si yoki @username
   TMDB_API_KEY         themoviedb.org dan
-  ANTHROPIC_API_KEY    console.anthropic.com dan (bo'lmasa oddiy regex ishlaydi)
+  GROQ_API_KEY         console.groq.com dan (bepul) YOKI ANTHROPIC_API_KEY
+                       (ikkalasi ham bo'lmasa oddiy regex ishlaydi, aniqligi past)
 """
 import os
 import re
@@ -35,6 +36,8 @@ RESERVE_ID = int(os.getenv("RESERVE_CHANNEL_ID", "0") or 0)
 AD_CHANNEL = os.getenv("AD_CHANNEL_ID", "").strip()
 TMDB_KEY = os.getenv("TMDB_API_KEY", "").strip()
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+GROQ_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = "llama-3.3-70b-versatile"
 AI_MODEL = "claude-haiku-5-5"
 DELAY = 4  # postlar orasidagi kutish (soniya), Telegram limitidan oshmaslik uchun
 DEFAULT_POSTER = "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500&q=80"
@@ -90,6 +93,14 @@ JUNK = re.compile(
     r"x264|x265|hevc|aac|mkv|mp4|avi|uzbek|o'zbek|ozbek|tarjima|uzbekcha|kino|film|skachat|yuklab)\b)",
     re.I,
 )
+LABELS = r"(?:Tili|Sifati|Yili|Janri|Janr|Davlat|Til|Sifat|Yil|Reyting|Tavsif|Mamlakat)"
+
+
+def get_http():
+    global _http
+    if _http is None:
+        _http = httpx.AsyncClient(timeout=30)
+    return _http
 
 
 def regex_clean(raw: str) -> dict:
@@ -105,30 +116,66 @@ def regex_clean(raw: str) -> dict:
     return {"title": text, "search_title": text, "year": year}
 
 
-async def ai_parse(raw: str) -> dict:
-    """Claude yordamida nom va yilni ajratadi. Xato bo'lsa regex ga qaytadi."""
+def regex_parse(caption: str, fname: str) -> dict:
+    """'Nomi: ... Yili: (2007)' ko'rinishidagi captionni ajratadi, bo'lmasa fayl nomidan oladi."""
+    cap = caption or ""
+    m = re.search(rf"Nomi\s*[:：]\s*(.+?)(?=\s*{LABELS}\s*[:：]|\n|$)", cap, re.I)
+    y = re.search(r"(?:Yili|Yil)\s*[:：]\s*\(?\s*((?:19|20)\d{2})", cap, re.I)
+    if m and m.group(1).strip():
+        title = re.sub(r"\s+", " ", JUNK.sub(" ", m.group(1))).strip(" -:.")
+        if title:
+            return {"title": title, "search_title": title, "year": int(y.group(1)) if y else None}
+    base = regex_clean(fname) if fname else {"title": "", "search_title": "", "year": None}
+    if not base["title"] and cap:
+        base = regex_clean(cap)
+    if y and not base["year"]:
+        base["year"] = int(y.group(1))
+    return base
+
+
+async def llm(system: str, user: str, json_mode: bool = False, max_tokens: int = 300):
+    """Groq (bepul) yoki Anthropic orqali so'rov. Kalit bo'lmasa None qaytaradi."""
     global _ai
-    base = regex_clean(raw)
-    if not (ANTHROPIC_KEY and AsyncAnthropic):
-        return base
-    try:
+    if GROQ_KEY:
+        body = {
+            "model": GROQ_MODEL, "temperature": 0.1, "max_tokens": max_tokens,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        }
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+        r = await get_http().post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_KEY}"}, json=body,
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    if ANTHROPIC_KEY and AsyncAnthropic:
         _ai = _ai or AsyncAnthropic(api_key=ANTHROPIC_KEY)
         resp = await _ai.messages.create(
-            model=AI_MODEL,
-            max_tokens=200,
-            system=(
-                "Sen kino nomini aniqlovchi yordamchisan. Berilgan matn Telegram kanaldagi kino captioni yoki fayl nomi. "
-                "Undagi reklama, @username, havola, sifat (1080p), tarjima/studiya nomlari kabi ortiqcha narsalarni tashla. "
-                "Faqat JSON qaytar, boshqa hech narsa yozma: "
-                '{"title": "matndagi toza nom", "search_title": "kinoning asl (ingliz) nomi, TMDB da qidirish uchun", "year": 2009 yoki null}. '
-                "Agar nomni aniqlab bo'lmasa title ni bo'sh qoldir."
-            ),
-            messages=[{"role": "user", "content": raw[:800]}],
+            model=AI_MODEL, max_tokens=max_tokens, system=system, messages=[{"role": "user", "content": user}],
         )
-        txt = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
-        txt = re.sub(r"```json|```", "", txt).strip()
-        data = json.loads(txt)
-        title = (data.get("title") or "").strip()
+        return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    return None
+
+
+async def ai_parse(caption: str, fname: str) -> dict:
+    """AI nom va yilni ajratadi, o'zbekcha nomni asl (ingliz) nomga o'giradi. Xato bo'lsa regex."""
+    base = regex_parse(caption, fname)
+    try:
+        out = await llm(
+            "You extract movie info from a Telegram post caption (Uzbek/Russian) and a file name. "
+            "Ignore ads, @usernames, links, 'subscribe' texts, quality (1080p), language and studio labels. "
+            "Return ONLY JSON: {\"title\": \"clean title as written in the post\", "
+            "\"search_title\": \"the movie's ORIGINAL title as on TMDB/IMDb; if the title is Uzbek/Russian, translate it back "
+            "to the original English title, e.g. '28 Haftadan keyin' -> '28 Weeks Later'\", \"year\": 2007 or null}. "
+            "If no movie title can be determined, use an empty string for title.",
+            f"Caption: {caption[:600]}\nFile name: {fname[:200]}",
+            json_mode=True,
+        )
+        if out is None:
+            return base
+        data = json.loads(re.sub(r"```json|```", "", out).strip())
+        title = (data.get("title") or "").strip() or base["title"]
         if not title:
             return base
         year = data.get("year")
@@ -147,33 +194,24 @@ async def ai_short_uz(text: str, title: str) -> str:
     text = (text or "").strip()
     if not text:
         return ""
-    if not (ANTHROPIC_KEY and AsyncAnthropic):
-        return text[:220]
     try:
-        global _ai
-        _ai = _ai or AsyncAnthropic(api_key=ANTHROPIC_KEY)
-        resp = await _ai.messages.create(
-            model=AI_MODEL,
+        out = await llm(
+            "Kino tavsifini o'zbek tilida (lotin yozuvida) 1-2 gapga, 200 belgidan oshmasdan qisqartir. "
+            "Spoiler yozma. Faqat tayyor matnni qaytar.",
+            f"Kino: {title}\nTavsif: {text[:1200]}",
             max_tokens=250,
-            system=(
-                "Kino tavsifini o'zbek tilida (lotin yozuvida) 1-2 gapga, 200 belgidan oshmasdan qisqartir. "
-                "Spoiler yozma. Faqat tayyor matnni qaytar."
-            ),
-            messages=[{"role": "user", "content": f"Kino: {title}\nTavsif: {text[:1200]}"}],
         )
-        out = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
-        return out[:260] or text[:220]
+        if out:
+            return out.strip()[:260]
     except Exception as e:
         print("ai_short_uz xato:", e)
-        return text[:220]
+    return text[:220]
 
 
 # ---------------------------------------------------------------------- TMDB
 async def tmdb(path: str, **params):
-    global _http
-    _http = _http or httpx.AsyncClient(timeout=20)
     params["api_key"] = TMDB_KEY
-    r = await _http.get(f"https://api.themoviedb.org/3{path}", params=params)
+    r = await get_http().get(f"https://api.themoviedb.org/3{path}", params=params)
     r.raise_for_status()
     return r.json()
 
@@ -245,10 +283,10 @@ async def process(message: types.Message):
         stats["dup"] += 1
         return
 
-    raw = (message.caption or "").strip()
-    if not raw or len(re.sub(r"@\w+|https?://\S+|t\.me/\S+", "", raw).strip()) < 2:
-        raw = getattr(media, "file_name", "") or raw
-    parsed = await ai_parse(raw)
+    caption = (message.caption or "").strip()
+    fname = getattr(media, "file_name", "") or ""
+    raw = caption or fname
+    parsed = await ai_parse(caption, fname)
     if not parsed["title"]:
         stats["fail"] += 1
         await notify_admin(f"⚠️ Nomini aniqlab bo‘lmadi (zaxira kanal, xabar #{message.message_id}).\nMatn: <code>{html.escape(raw[:200])}</code>")

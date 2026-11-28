@@ -12,6 +12,7 @@ Kerakli environment o'zgaruvchilar (Render -> Environment):
   RESERVE_CHANNEL_ID   zaxira kanal ID si (masalan -1001234567890)
   AD_CHANNEL_ID        reklama kanal ID si yoki @username
   TMDB_API_KEY         themoviedb.org dan
+  POST_DELAY           postlar orasidagi soniya (ixtiyoriy, standart 60)
   GROQ_API_KEY         console.groq.com dan (bepul) YOKI ANTHROPIC_API_KEY
                        (ikkalasi ham bo'lmasa oddiy regex ishlaydi, aniqligi past)
 """
@@ -37,9 +38,9 @@ AD_CHANNEL = os.getenv("AD_CHANNEL_ID", "").strip()
 TMDB_KEY = os.getenv("TMDB_API_KEY", "").strip()
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 GROQ_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
 AI_MODEL = "claude-haiku-5-5"
-DELAY = 4  # postlar orasidagi kutish (soniya), Telegram limitidan oshmaslik uchun
+DELAY = int(os.getenv("POST_DELAY", "60"))  # muvaffaqiyatli postdan keyingi kutish (soniya)
 DEFAULT_POSTER = "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500&q=80"
 
 GENRES_UZ = {
@@ -141,6 +142,9 @@ async def llm(system: str, user: str, json_mode: bool = False, max_tokens: int =
             "model": GROQ_MODEL, "temperature": 0.1, "max_tokens": max_tokens,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         }
+        if "gpt-oss" in GROQ_MODEL:
+            body["reasoning_effort"] = "low"  # fikrlash kam, javob tez
+            body["max_tokens"] = max_tokens + 800  # fikrlash tokenlari uchun zaxira
         if json_mode:
             body["response_format"] = {"type": "json_object"}
         r = await get_http().post(
@@ -353,13 +357,15 @@ async def process(message: types.Message):
             await notify_admin(f"⚠️ Reklama kanalga post chiqmadi ({html.escape(title)}): {html.escape(str(e))}")
 
     stats["ok"] += 1
+    return True
 
 
 async def worker():
     while True:
         message = await queue.get()
+        posted = False
         try:
-            await process(message)
+            posted = bool(await process(message))
         except Exception as e:
             stats["fail"] += 1
             print("auto_import xato:", e)
@@ -370,4 +376,4 @@ async def worker():
                 f"✅ Navbat tugadi.\nQo‘shildi: <b>{stats['ok']}</b>\nTopilmadi/xato: <b>{stats['fail']}</b>\nTakror: <b>{stats['dup']}</b>"
             )
             stats.update(ok=0, fail=0, dup=0)
-        await asyncio.sleep(DELAY)
+        await asyncio.sleep(DELAY if posted else 2)  # xato/takror bo'lsa uzoq kutmaydi
